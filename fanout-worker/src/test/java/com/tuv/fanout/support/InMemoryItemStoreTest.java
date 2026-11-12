@@ -161,4 +161,43 @@ class InMemoryItemStoreTest {
         assertThat(store.itemOf(id)).extracting(WorkItem::attemptNumber, WorkItem::deliveryCount)
                 .as("not attempted: delivery refunded, key kept").containsExactly(2, 2);
     }
+
+    @Test
+    void aHandedBackItemKeepsItsKeyAndGetsItsDeliveryRefunded() {
+        store.enqueue(List.of(item("e1")));
+        ItemId id = item("e1").id();
+        store.requeue(leaseAt(T0), RequeueReason.OUTCOME_UNKNOWN, T0);
+        store.requeue(leaseAt(T0), RequeueReason.OUTCOME_UNKNOWN, T0);
+        store.requeue(leaseAt(T0), RequeueReason.OUTCOME_UNKNOWN, T0);
+        assertThat(store.itemOf(id).deliveryCount()).isEqualTo(3);
+
+        store.requeue(leaseAt(T0), RequeueReason.HANDED_BACK, T0);
+        assertThat(store.itemOf(id)).extracting(WorkItem::attemptNumber, WorkItem::deliveryCount)
+                .as("4 deliveries, one refunded").containsExactly(1, 3);
+
+        for (int restart = 0; restart < 5; restart++) {
+            store.requeue(leaseAt(T0), RequeueReason.HANDED_BACK, T0);
+        }
+        assertThat(store.itemOf(id).deliveryCount()).as("restarts no longer cost deliveries").isEqualTo(3);
+    }
+
+    @Test
+    void anItemHandedBackOnItsFirstDeliveryIsNextLeasedAsDeliveryTwo() {
+        store.enqueue(List.of(item("e1")));
+
+        store.requeue(leaseAt(T0), RequeueReason.HANDED_BACK, T0);
+
+        assertThat(leaseAt(T0).item().deliveryCount()).isEqualTo(2);
+    }
+
+    @Test
+    void aHandBackNeverLowersTheStoredCountBelowOne() {
+        store.enqueue(List.of(item("e1")));
+        ItemId id = item("e1").id();
+
+        for (int restart = 0; restart < 5; restart++) {
+            store.requeue(leaseAt(T0), RequeueReason.HANDED_BACK, T0);
+            assertThat(store.itemOf(id).deliveryCount()).isEqualTo(1);
+        }
+    }
 }

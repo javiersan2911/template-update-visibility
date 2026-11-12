@@ -11,10 +11,12 @@ import com.tuv.fanout.domain.FirmId;
 import com.tuv.fanout.domain.ItemId;
 import com.tuv.fanout.domain.ItemStatus;
 import com.tuv.fanout.domain.Lease;
+import com.tuv.fanout.domain.RequeueReason;
 import com.tuv.fanout.domain.VersionPin;
 import com.tuv.fanout.port.ApplyCommand;
 import com.tuv.fanout.port.FanOutSource.Target;
 import com.tuv.fanout.port.ItemLeasing;
+import com.tuv.fanout.port.LeaseWriter;
 import com.tuv.fanout.schedule.RoundRobinScheduler;
 import com.tuv.fanout.support.FakeEngagementGateway;
 import com.tuv.fanout.support.FakeEngagementGateway.Behavior;
@@ -57,9 +59,18 @@ class FanOutDispatcherTest {
 
     private FanOutDispatcher dispatcher(
             ItemLeasing leasing, FakeEngagementGateway gateway, AimdCapacityLimiter limiter, DispatcherConfig config) {
+        return dispatcher(leasing, store, gateway, limiter, config);
+    }
+
+    private FanOutDispatcher dispatcher(
+            ItemLeasing leasing,
+            LeaseWriter writer,
+            FakeEngagementGateway gateway,
+            AimdCapacityLimiter limiter,
+            DispatcherConfig config) {
         RetryPolicy retryPolicy = new RetryPolicy(3, Duration.ofMillis(1), Duration.ofMillis(5), new Random(1));
         ItemProcessor processor = new ItemProcessor(
-                store, gateway, (engagementId, pin) -> true, limiter, retryPolicy, config, clock);
+                writer, gateway, (engagementId, pin) -> true, limiter, retryPolicy, config, clock);
         return new FanOutDispatcher(leasing, new RoundRobinScheduler(), limiter, processor, config, clock);
     }
 
@@ -138,7 +149,7 @@ class FanOutDispatcherTest {
             awaitAllTerminal();
         }
 
-        assertThat(store.statusOf(ItemId.of(PIN, poisoned))).isEqualTo(ItemStatus.FAILED);
+        assertThat(store.statusOf(ItemId.of(BIG_FIRM, PIN, poisoned))).isEqualTo(ItemStatus.FAILED);
         assertThat(store.count(ItemStatus.DONE)).isEqualTo(29);
         targets.remove(29);
         assertEveryEngagementAppliedExactlyOnce(gateway);
@@ -160,6 +171,22 @@ class FanOutDispatcherTest {
         runToCompletion(gateway, Duration.ofSeconds(30));
 
         assertAllDoneUnderOneKeyEach(gateway, 12);
+    }
+
+    @Test
+    void closeReturnsOnlyAfterInterruptedWorkersHaveHandedTheirItemsBack() {
+        FakeEngagementGateway gateway = new FakeEngagementGateway(Duration.ofHours(1));
+        publish(BIG_FIRM, 4);
+        LeaseWriter slowHandBack = new SlowRequeue(store, Duration.ofMillis(300));
+        FanOutDispatcher dispatcher = dispatcher(
+                store, slowHandBack, gateway, fixedLimiter(4, 4), config(Duration.ofSeconds(30), Duration.ZERO));
+        dispatcher.start();
+        await().atMost(TIMEOUT).until(() -> gateway.submissionCount() >= 4);
+
+        dispatcher.close();
+
+        assertThat(store.count(ItemStatus.LEASED)).isZero();
+        assertThat(store.count(ItemStatus.READY)).isEqualTo(4);
     }
 
     @Test
@@ -217,7 +244,7 @@ class FanOutDispatcherTest {
         assertThat(targets).allSatisfy(target ->
                 assertThat(gateway.submittedAttemptIds(target.engagementId()))
                         .as("redelivery reuses the idempotency key")
-                        .containsOnly(store.itemOf(ItemId.of(PIN, target.engagementId())).attemptId()));
+                        .containsOnly(store.itemOf(ItemId.of(target.firmId(), PIN, target.engagementId())).attemptId()));
     }
 
     @Test
@@ -292,6 +319,38 @@ class FanOutDispatcherTest {
         }
 
         assertThat(leasing.attempts()).as("5, 10, 20, 40, 80, 160 ms cool-offs").isBetween(2, 12);
+    }
+
+    /** A store whose {@code requeue} takes a while, as a loaded database would. */
+    private static final class SlowRequeue implements LeaseWriter {
+
+        private final LeaseWriter delegate;
+        private final Duration delay;
+
+        private SlowRequeue(LeaseWriter delegate, Duration delay) {
+            this.delegate = delegate;
+            this.delay = delay;
+        }
+
+        @Override
+        public boolean renew(Lease lease, Instant newExpiry) {
+            return delegate.renew(lease, newExpiry);
+        }
+
+        @Override
+        public boolean finish(Lease lease, ItemStatus terminalStatus, String detail) {
+            return delegate.finish(lease, terminalStatus, detail);
+        }
+
+        @Override
+        public boolean requeue(Lease lease, RequeueReason reason, Instant notBefore) {
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                throw new IllegalStateException("interrupted while handing back", e);
+            }
+            return delegate.requeue(lease, reason, notBefore);
+        }
     }
 
     /** Throws from {@code leaseNext} for the selected firms, at most {@code maxFailures} times. */

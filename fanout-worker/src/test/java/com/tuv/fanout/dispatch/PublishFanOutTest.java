@@ -61,4 +61,16 @@ class PublishFanOutTest {
 
         assertThat(closed).isTrue();
     }
+
+    @Test
+    void theSameEngagementIdUnderTwoFirmsGetsTwoItems() {
+        EngagementId shared = new EngagementId("e1");
+        PublishFanOut fanOut = new PublishFanOut(
+                pin -> Stream.of(new Target(new FirmId("firm-a"), shared), new Target(new FirmId("firm-b"), shared)),
+                store, 10);
+
+        assertThat(fanOut.onPublished(PIN)).isEqualTo(2);
+
+        assertThat(store.size()).isEqualTo(2);
+    }
 }

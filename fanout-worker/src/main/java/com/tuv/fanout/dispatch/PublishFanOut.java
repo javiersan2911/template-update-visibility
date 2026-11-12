@@ -12,8 +12,8 @@ import java.util.Objects;
 import java.util.stream.Stream;
 
 /**
- * Turns one publish into durable work items. Item ids are derived from the pin and the
- * engagement, so handling the same publish event again, or resuming after a crash halfway
+ * Turns one publish into durable work items. Item ids are derived from the firm, the pin and
+ * the engagement, so handling the same publish event again, or resuming after a crash halfway
  * through, adds only the items that are still missing.
  */
 public final class PublishFanOut {
