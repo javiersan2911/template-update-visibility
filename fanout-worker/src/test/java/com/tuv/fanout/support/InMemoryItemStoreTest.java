@@ -156,5 +156,9 @@ class InMemoryItemStoreTest {
         store.requeue(leaseAt(T0), RequeueReason.ATTEMPT_FAILED, T0);
         assertThat(store.itemOf(id)).extracting(WorkItem::attemptNumber, WorkItem::deliveryCount)
                 .as("definite failure: delivery spent, new key").containsExactly(2, 2);
+
+        store.requeue(leaseAt(T0), RequeueReason.NOT_ATTEMPTED, T0);
+        assertThat(store.itemOf(id)).extracting(WorkItem::attemptNumber, WorkItem::deliveryCount)
+                .as("not attempted: delivery refunded, key kept").containsExactly(2, 2);
     }
 }

@@ -14,17 +14,26 @@ import com.tuv.fanout.domain.FirmId;
 import com.tuv.fanout.domain.ItemId;
 import com.tuv.fanout.domain.ItemStatus;
 import com.tuv.fanout.domain.Lease;
+import com.tuv.fanout.domain.RequeueReason;
 import com.tuv.fanout.domain.VersionPin;
 import com.tuv.fanout.domain.WorkItem;
+import com.tuv.fanout.domain.AttemptId;
 import com.tuv.fanout.port.ApplyCommand;
+import com.tuv.fanout.port.AttemptStatus;
+import com.tuv.fanout.port.EngagementGateway;
+import com.tuv.fanout.port.LeaseWriter;
 import com.tuv.fanout.port.OfferVerifier;
+import com.tuv.fanout.port.SubmitResult;
 import com.tuv.fanout.support.FakeEngagementGateway;
 import com.tuv.fanout.support.InMemoryItemStore;
 import com.tuv.fanout.support.RecordingFeedback;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class ItemProcessorTest {
@@ -48,9 +57,22 @@ class ItemProcessorTest {
     private final RecordingFeedback feedback = new RecordingFeedback();
 
     private ItemProcessor processor(OfferVerifier offerVerifier) {
-        RetryPolicy noDelay = new RetryPolicy(MAX_DELIVERIES, Duration.ZERO, Duration.ZERO, new Random(1));
-        return new ItemProcessor(store, gateway, offerVerifier, feedback, noDelay, CONFIG, clock);
+        return processor(store, gateway, offerVerifier);
     }
+
+    private ItemProcessor processor(LeaseWriter writer, EngagementGateway downstream, OfferVerifier offerVerifier) {
+        RetryPolicy noDelay = new RetryPolicy(MAX_DELIVERIES, Duration.ZERO, Duration.ZERO, new Random(1));
+        return new ItemProcessor(writer, downstream, offerVerifier, feedback, noDelay, CONFIG, clock);
+    }
+
+    /** Leases the already-enqueued item again, as the dispatcher would after a requeue. */
+    private void deliverAgain(ItemProcessor processor) {
+        processor.process(store.leaseNext(FIRM, clock.instant(), CONFIG.leaseDuration()).orElseThrow());
+    }
+
+    private static final OfferVerifier VERIFIER_DOWN = (engagementId, pin) -> {
+        throw new IllegalStateException("offer service unreachable");
+    };
 
     private ItemProcessor processor() {
         return processor((engagementId, pin) -> true);
@@ -248,6 +270,209 @@ class ItemProcessorTest {
 
         assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.FAILED);
         assertThat(gateway.submissionCount()).isZero();
+    }
+
+    @Test
+    void anOfferVerifierThatKeepsFailingNeverSpendsTheDeliveryBudget() {
+        ItemProcessor broken = processor(VERIFIER_DOWN);
+
+        deliver(broken);
+        deliverAgain(broken);
+        deliverAgain(broken);
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM).deliveryCount()).as("every delivery refunded").isZero();
+        assertThat(gateway.submissionCount()).isZero();
+        assertThat(feedback.overloads()).as("nothing was sent, so no limiter signal").isZero();
+
+        deliverAgain(processor());
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(gateway.submittedAttemptIds(ENGAGEMENT)).containsExactly(store.itemOf(ITEM).attemptId());
+    }
+
+    @Test
+    void aLeaseRenewalThatFailsBeforeSubmitNeverSpendsTheDeliveryBudget() {
+        FailingRenewals renewals = new FailingRenewals(store, MAX_DELIVERIES);
+        ItemProcessor broken = processor(renewals, gateway, (engagementId, pin) -> true);
+
+        deliver(broken);
+        deliverAgain(broken);
+        deliverAgain(broken);
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM).deliveryCount()).isZero();
+        assertThat(gateway.submissionCount()).isZero();
+        assertThat(feedback.overloads()).isZero();
+
+        deliverAgain(broken);
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(gateway.submissionCount()).isEqualTo(1);
+    }
+
+    @Test
+    void aTransportErrorOnSubmitSignalsOverloadOncePerFailureAndEndsAsATransportFailure() {
+        gateway.script(ENGAGEMENT, THROW_ON_SUBMIT, THROW_ON_SUBMIT, THROW_ON_SUBMIT);
+        ItemProcessor processor = processor();
+
+        deliver(processor);
+        assertThat(feedback.overloads()).isEqualTo(1);
+        deliverAgain(processor);
+        assertThat(feedback.overloads()).isEqualTo(2);
+        deliverAgain(processor);
+
+        assertThat(feedback.overloads()).isEqualTo(3);
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.FAILED);
+        assertThat(store.detailOf(ITEM)).contains("submit failed: transport error").contains("3 deliveries");
+        assertThat(gateway.submittedAttemptIds(ENGAGEMENT)).hasSize(3).containsOnly(store.itemOf(ITEM).attemptId());
+    }
+
+    @Test
+    void aStatusEndpointThatStaysDownReleasesTheItemAfterThreeReadsNotAfterTheAttemptTimeout() {
+        gateway.failStatusAlways();
+
+        deliver(processor());
+
+        assertThat(gateway.statusCallCount()).isEqualTo(3);
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM).attemptNumber()).isEqualTo(1);
+        assertThat(store.itemOf(ITEM).deliveryCount()).as("a submit was made, so no refund").isEqualTo(1);
+        assertThat(feedback.overloads()).isEqualTo(1);
+        assertThat(gateway.submittedAttemptIds(ENGAGEMENT)).containsExactly(store.itemOf(ITEM).attemptId());
+    }
+
+    @Test
+    void anUnreadableStatusNeverFailsAnItemSubmittedOnItsLastDelivery() {
+        AtomicBoolean statusDown = new AtomicBoolean();
+        EngagementGateway downAfterSubmit = new EngagementGateway() {
+            @Override
+            public SubmitResult submit(ApplyCommand command) {
+                statusDown.set(true);
+                return gateway.submit(command);
+            }
+
+            @Override
+            public AttemptStatus status(AttemptId attemptId) {
+                if (statusDown.get()) {
+                    throw new IllegalStateException("status endpoint down");
+                }
+                return gateway.status(attemptId);
+            }
+        };
+        ItemProcessor processor = processor(store, downAfterSubmit, (engagementId, pin) -> true);
+        store.enqueue(List.of(WorkItem.create(FIRM, ENGAGEMENT, PIN)));
+        for (int crash = 0; crash < MAX_DELIVERIES - 1; crash++) {
+            store.leaseNext(FIRM, clock.instant(), Duration.ZERO).orElseThrow();
+        }
+
+        deliverAgain(processor);
+
+        assertThat(store.itemOf(ITEM).deliveryCount()).isEqualTo(MAX_DELIVERIES);
+        assertThat(store.statusOf(ITEM)).as("budget spent, but an unreadable status is no evidence of failure")
+                .isEqualTo(ItemStatus.READY);
+        assertThat(feedback.overloads()).isEqualTo(1);
+
+        statusDown.set(false);
+        deliverAgain(processor);
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(gateway.submissionCount()).as("the next delivery polls, it does not resubmit").isEqualTo(1);
+    }
+
+    @Test
+    void aRedeliveryWhoseStatusIsUnreadableIsRefundedAndSubmitsNothing() {
+        leaseThenCrashAfterSubmit();
+        gateway.failStatusAlways();
+
+        deliver(processor());
+
+        assertThat(gateway.statusCallCount()).isEqualTo(3);
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM).deliveryCount()).as("2nd delivery refunded").isEqualTo(1);
+        assertThat(gateway.submissionCount()).as("only the crashed worker's submit").isEqualTo(1);
+        assertThat(feedback.overloads()).isEqualTo(1);
+    }
+
+    @Test
+    void statusReadsThatFailTwiceAndThenAnswerStillAdoptTheOutcome() {
+        gateway.failStatusNext(2);
+
+        deliver(processor());
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(feedback.overloads()).isZero();
+        assertThat(gateway.submissionCount()).isEqualTo(1);
+    }
+
+    @Test
+    void aSuccessfulReadResetsTheCountOfConsecutiveStatusFailures() {
+        // Scripted, not timed: two failures, a running answer, two failures, then success.
+        AtomicInteger reads = new AtomicInteger();
+        EngagementGateway flaky = new EngagementGateway() {
+            @Override
+            public SubmitResult submit(ApplyCommand command) {
+                return new SubmitResult.Accepted();
+            }
+
+            @Override
+            public AttemptStatus status(AttemptId attemptId) {
+                int read = reads.getAndIncrement();
+                if (read % 3 != 2) {
+                    throw new IllegalStateException("status endpoint down");
+                }
+                return read < 5 ? AttemptStatus.IN_PROGRESS : AttemptStatus.SUCCEEDED;
+            }
+        };
+
+        deliver(processor(store, flaky, (engagementId, pin) -> true));
+
+        assertThat(reads.get()).as("four failed reads in total, never three in a row").isEqualTo(6);
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(feedback.overloads()).isZero();
+    }
+
+    @Test
+    void aRedeliveryWhoseStatusIsUnreadableOnceAndThenNotFoundSubmitsAndCompletes() {
+        gateway.script(ENGAGEMENT, LOSE_SUBMIT);
+        leaseThenCrashAfterSubmit();
+        gateway.failStatusNext(1);
+
+        deliver(processor());
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(gateway.submittedAttemptIds(ENGAGEMENT)).hasSize(2).containsOnly(store.itemOf(ITEM).attemptId());
+        assertThat(gateway.successfulApplies(ENGAGEMENT)).isEqualTo(1);
+    }
+
+    /** Fails the first {@code failures} renewals, as a store blip would, then behaves. */
+    private static final class FailingRenewals implements LeaseWriter {
+
+        private final LeaseWriter delegate;
+        private final AtomicInteger remainingFailures;
+
+        private FailingRenewals(LeaseWriter delegate, int failures) {
+            this.delegate = delegate;
+            this.remainingFailures = new AtomicInteger(failures);
+        }
+
+        @Override
+        public boolean renew(Lease lease, Instant newExpiry) {
+            if (remainingFailures.getAndDecrement() > 0) {
+                throw new IllegalStateException("store unavailable");
+            }
+            return delegate.renew(lease, newExpiry);
+        }
+
+        @Override
+        public boolean finish(Lease lease, ItemStatus terminalStatus, String detail) {
+            return delegate.finish(lease, terminalStatus, detail);
+        }
+
+        @Override
+        public boolean requeue(Lease lease, RequeueReason reason, Instant notBefore) {
+            return delegate.requeue(lease, reason, notBefore);
+        }
     }
 
     /** A worker that leased the item, got its submit accepted, then died. */

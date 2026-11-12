@@ -14,15 +14,21 @@ import com.tuv.fanout.domain.Lease;
 import com.tuv.fanout.domain.VersionPin;
 import com.tuv.fanout.port.ApplyCommand;
 import com.tuv.fanout.port.FanOutSource.Target;
+import com.tuv.fanout.port.ItemLeasing;
 import com.tuv.fanout.schedule.RoundRobinScheduler;
 import com.tuv.fanout.support.FakeEngagementGateway;
 import com.tuv.fanout.support.FakeEngagementGateway.Behavior;
 import com.tuv.fanout.support.InMemoryItemStore;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -46,10 +52,15 @@ class FanOutDispatcherTest {
 
     private FanOutDispatcher dispatcher(
             FakeEngagementGateway gateway, AimdCapacityLimiter limiter, DispatcherConfig config) {
+        return dispatcher(store, gateway, limiter, config);
+    }
+
+    private FanOutDispatcher dispatcher(
+            ItemLeasing leasing, FakeEngagementGateway gateway, AimdCapacityLimiter limiter, DispatcherConfig config) {
         RetryPolicy retryPolicy = new RetryPolicy(3, Duration.ofMillis(1), Duration.ofMillis(5), new Random(1));
         ItemProcessor processor = new ItemProcessor(
                 store, gateway, (engagementId, pin) -> true, limiter, retryPolicy, config, clock);
-        return new FanOutDispatcher(store, new RoundRobinScheduler(), limiter, processor, config, clock);
+        return new FanOutDispatcher(leasing, new RoundRobinScheduler(), limiter, processor, config, clock);
     }
 
     private AimdCapacityLimiter fixedLimiter(int globalLimit, int perFirmCap) {
@@ -221,5 +232,103 @@ class FanOutDispatcherTest {
         }
 
         assertThat(store.count(ItemStatus.DONE)).isEqualTo(10);
+    }
+
+    @Test
+    void aFirmWhoseLeaseFailsDoesNotStallTheOtherFirms() {
+        FirmId broken = new FirmId("a-broken");
+        FakeEngagementGateway gateway = new FakeEngagementGateway(Duration.ofMillis(5));
+        publish(broken, 3);
+        List<FirmId> healthy = IntStream.range(0, 3).mapToObj(i -> new FirmId("b-ok-" + i)).toList();
+        healthy.forEach(firm -> publish(firm, 4));
+        FlakyLeasing leasing = new FlakyLeasing(store, firm -> firm.equals(broken), Integer.MAX_VALUE);
+        AimdCapacityLimiter limiter = fixedLimiter(4, 4);
+
+        try (FanOutDispatcher dispatcher =
+                dispatcher(leasing, gateway, limiter, config(Duration.ofSeconds(30), TIMEOUT))) {
+            dispatcher.start();
+            await().atMost(TIMEOUT).until(
+                    () -> healthy.stream().allMatch(firm -> store.countUnfinished(firm) == 0));
+
+            publish(new FirmId("c-late"), 3);
+            await().atMost(TIMEOUT).until(() -> store.countUnfinished(new FirmId("c-late")) == 0);
+        }
+
+        assertThat(store.count(ItemStatus.DONE)).isEqualTo(15);
+        assertThat(store.countUnfinished(broken)).isEqualTo(3);
+        assertThat(IntStream.range(0, 4).mapToObj(i -> limiter.tryAcquire(BIG_FIRM)))
+                .as("every permit was released").allSatisfy(permit -> assertThat(permit).isPresent());
+    }
+
+    @Test
+    void aFirmThatFailsOnceAndRecoversGetsItsItemsProcessed() {
+        FirmId flaky = new FirmId("a-flaky");
+        FakeEngagementGateway gateway = new FakeEngagementGateway(Duration.ofMillis(5));
+        publish(flaky, 5);
+        publish(new FirmId("b-ok"), 5);
+        FlakyLeasing leasing = new FlakyLeasing(store, firm -> firm.equals(flaky), 1);
+
+        try (FanOutDispatcher dispatcher =
+                dispatcher(leasing, gateway, fixedLimiter(4, 4), config(Duration.ofSeconds(30), TIMEOUT))) {
+            dispatcher.start();
+            awaitAllTerminal();
+        }
+
+        assertThat(store.count(ItemStatus.DONE)).isEqualTo(10);
+        assertThat(leasing.failures()).isEqualTo(1);
+    }
+
+    @Test
+    void aFailingFirmIsLeftAloneForAWhileInsteadOfBeingRetriedEveryPass() throws InterruptedException {
+        FirmId broken = new FirmId("a-broken");
+        FakeEngagementGateway gateway = new FakeEngagementGateway(Duration.ofMillis(5));
+        publish(broken, 2);
+        FlakyLeasing leasing = new FlakyLeasing(store, firm -> true, Integer.MAX_VALUE);
+
+        try (FanOutDispatcher dispatcher =
+                dispatcher(leasing, gateway, fixedLimiter(4, 4), config(Duration.ofSeconds(30), Duration.ZERO))) {
+            dispatcher.start();
+            Thread.sleep(400);
+        }
+
+        assertThat(leasing.attempts()).as("5, 10, 20, 40, 80, 160 ms cool-offs").isBetween(2, 12);
+    }
+
+    /** Throws from {@code leaseNext} for the selected firms, at most {@code maxFailures} times. */
+    private static final class FlakyLeasing implements ItemLeasing {
+
+        private final ItemLeasing delegate;
+        private final Predicate<FirmId> failsFor;
+        private final int maxFailures;
+        private final AtomicInteger attempts = new AtomicInteger();
+        private final AtomicInteger failures = new AtomicInteger();
+
+        private FlakyLeasing(ItemLeasing delegate, Predicate<FirmId> failsFor, int maxFailures) {
+            this.delegate = delegate;
+            this.failsFor = failsFor;
+            this.maxFailures = maxFailures;
+        }
+
+        @Override
+        public Set<FirmId> firmsWithDispatchableItems(Instant now) {
+            return delegate.firmsWithDispatchableItems(now);
+        }
+
+        @Override
+        public Optional<Lease> leaseNext(FirmId firmId, Instant now, Duration leaseDuration) {
+            attempts.incrementAndGet();
+            if (failsFor.test(firmId) && failures.getAndIncrement() < maxFailures) {
+                throw new IllegalStateException("store unavailable for " + firmId);
+            }
+            return delegate.leaseNext(firmId, now, leaseDuration);
+        }
+
+        int attempts() {
+            return attempts.get();
+        }
+
+        int failures() {
+            return Math.min(failures.get(), maxFailures);
+        }
     }
 }

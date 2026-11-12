@@ -33,6 +33,9 @@ public final class FakeEngagementGateway implements EngagementGateway {
     private final List<ApplyCommand> submissions = new ArrayList<>();
     private final Map<FirmId, Integer> maxConcurrentByFirm = new HashMap<>();
     private int maxConcurrent;
+    private boolean statusDown;
+    private int statusFailuresPending;
+    private int statusCalls;
 
     public FakeEngagementGateway(Duration latency) {
         this.latency = latency;
@@ -68,6 +71,14 @@ public final class FakeEngagementGateway implements EngagementGateway {
 
     @Override
     public synchronized AttemptStatus status(AttemptId attemptId) {
+        statusCalls++;
+        if (statusDown) {
+            throw new IllegalStateException("status endpoint down");
+        }
+        if (statusFailuresPending > 0) {
+            statusFailuresPending--;
+            throw new IllegalStateException("status endpoint down");
+        }
         Attempt attempt = attempts.get(attemptId);
         if (attempt == null) {
             return AttemptStatus.NOT_FOUND;
@@ -80,6 +91,26 @@ public final class FakeEngagementGateway implements EngagementGateway {
             case FAIL_PERMANENT -> AttemptStatus.FAILED_PERMANENT;
             default -> AttemptStatus.SUCCEEDED;
         };
+    }
+
+    /** Every {@link #status} call throws until {@link #restoreStatus()}. */
+    public synchronized void failStatusAlways() {
+        statusDown = true;
+    }
+
+    /** The next {@code calls} {@link #status} calls throw; later ones answer normally. */
+    public synchronized void failStatusNext(int calls) {
+        statusFailuresPending = calls;
+    }
+
+    public synchronized void restoreStatus() {
+        statusDown = false;
+        statusFailuresPending = 0;
+    }
+
+    /** Status calls received, including the ones that threw. */
+    public synchronized int statusCallCount() {
+        return statusCalls;
     }
 
     /** How many times the engagement was really processed to success, deduplication applied. */

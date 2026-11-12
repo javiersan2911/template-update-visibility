@@ -9,8 +9,13 @@ import com.tuv.fanout.schedule.FairScheduler;
 import java.lang.System.Logger;
 import java.lang.System.Logger.Level;
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
@@ -24,12 +29,19 @@ import java.util.concurrent.TimeUnit;
  * the limiter grants a permit, and the store grants a lease. The permit bounds load on the
  * downstream system; the lease makes the item exclusive across workers and processes.
  *
+ * <p>A firm whose lease call throws is logged, skipped for a cool-off that doubles with
+ * each consecutive failure, and passed over in the rotation, so one broken firm cannot
+ * stall the rest.
+ *
  * <p>The dispatcher keeps no state of its own that matters. Killing it at any point loses
  * nothing: leases expire and another instance continues with the same idempotency keys.
  */
 public final class FanOutDispatcher implements AutoCloseable {
 
     private static final Logger LOG = System.getLogger(FanOutDispatcher.class.getName());
+
+    /** Longest a firm whose lease calls keep failing is left alone. */
+    private static final Duration MAX_COOL_OFF = Duration.ofMinutes(1);
 
     private final ItemLeasing store;
     private final FairScheduler scheduler;
@@ -38,6 +50,8 @@ public final class FanOutDispatcher implements AutoCloseable {
     private final DispatcherConfig config;
     private final Clock clock;
 
+    /** Touched by the dispatcher thread only. */
+    private final Map<FirmId, CoolOff> coolOffs = new HashMap<>();
     private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
     private final Semaphore wakeUps = new Semaphore(0);
     private volatile boolean running;
@@ -108,18 +122,24 @@ public final class FanOutDispatcher implements AutoCloseable {
     }
 
     /**
-     * Offers every firm with work at most one slot, in fair order.
+     * Offers every firm with work at most one slot, in fair order. A firm whose lease call
+     * fails is skipped for a growing cool-off and never holds up the others.
      *
      * @return whether anything was started; if not, nothing will change until an item
      *         finishes or new work arrives
      */
     private boolean dispatchPass() {
+        Instant now = clock.instant();
+        Set<FirmId> firms = store.firmsWithDispatchableItems(now);
+        coolOffs.keySet().retainAll(firms);
         boolean started = false;
-        for (FirmId firm : scheduler.order(store.firmsWithDispatchableItems(clock.instant()))) {
+        for (FirmId firm : scheduler.order(firms)) {
             if (!limiter.hasCapacity()) {
                 break;
             }
-            started |= tryStart(firm);
+            if (!isCoolingOff(firm, now)) {
+                started |= tryStart(firm);
+            }
         }
         return started;
     }
@@ -130,12 +150,21 @@ public final class FanOutDispatcher implements AutoCloseable {
             return false;
         }
         Permit permit = acquired.get();
+        Optional<Lease> lease;
         try {
-            Optional<Lease> lease = store.leaseNext(firm, clock.instant(), config.leaseDuration());
-            if (lease.isEmpty()) {
-                permit.close();
-                return false;
-            }
+            lease = store.leaseNext(firm, clock.instant(), config.leaseDuration());
+        } catch (RuntimeException e) {
+            permit.close();
+            coolOff(firm, e);
+            scheduler.served(firm);
+            return false;
+        }
+        coolOffs.remove(firm);
+        if (lease.isEmpty()) {
+            permit.close();
+            return false;
+        }
+        try {
             scheduler.served(firm);
             workers.execute(() -> runItem(lease.get(), permit));
             return true;
@@ -144,6 +173,25 @@ public final class FanOutDispatcher implements AutoCloseable {
             throw e;
         }
     }
+
+    private boolean isCoolingOff(FirmId firm, Instant now) {
+        CoolOff coolOff = coolOffs.get(firm);
+        return coolOff != null && now.isBefore(coolOff.notBefore());
+    }
+
+    /** Skips the firm until a not-before instant; the delay doubles with each consecutive failure. */
+    private void coolOff(FirmId firm, RuntimeException cause) {
+        int failures = coolOffs.containsKey(firm) ? coolOffs.get(firm).failures() + 1 : 1;
+        Duration delay = config.idleDelay().multipliedBy(1L << Math.min(failures - 1, 20));
+        if (delay.compareTo(MAX_COOL_OFF) > 0) {
+            delay = MAX_COOL_OFF;
+        }
+        coolOffs.put(firm, new CoolOff(failures, clock.instant().plus(delay)));
+        LOG.log(Level.WARNING, "Leasing failed for firm " + firm + " (" + failures
+                + " consecutive); skipping it for " + delay, cause);
+    }
+
+    private record CoolOff(int failures, Instant notBefore) {}
 
     private void runItem(Lease lease, Permit permit) {
         try (permit) {

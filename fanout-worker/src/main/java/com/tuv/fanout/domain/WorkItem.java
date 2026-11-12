@@ -47,7 +47,7 @@ public record WorkItem(
 
     public WorkItem requeued(RequeueReason reason) {
         return switch (reason) {
-            case CAPACITY_DEFERRED ->
+            case CAPACITY_DEFERRED, NOT_ATTEMPTED ->
                     new WorkItem(id, firmId, engagementId, pin, attemptNumber, deliveryCount - 1);
             case OUTCOME_UNKNOWN -> this;
             case ATTEMPT_FAILED ->
