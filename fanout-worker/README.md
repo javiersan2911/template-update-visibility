@@ -28,9 +28,9 @@ mvn test        # Java 21+, Maven 3.9+
 |---|---|---|
 | Concurrency | Virtual thread per in-flight item; exclusive, time-bounded leases with a fencing token | `FanOutDispatcher`, `ItemStore`, `Lease` |
 | Downstream capacity | Global limit adapted by AIMD (halve on throttle or timeout, grow slowly while healthy), a per-firm cap, and a full admission pause for as long as a 429 asks | `AimdCapacityLimiter` |
-| Fairness | Round robin across firms, one item per turn | `RoundRobinScheduler` |
+| Fairness | Round robin across firms, one item per turn; a firm whose lease call fails is skipped for a doubling cool-off (cap 1 minute) so it cannot stall the others | `RoundRobinScheduler`, `FanOutDispatcher` |
 | Idempotency | Deterministic item ids; attempt id reused while the outcome is unknown, rotated only after a definite failure | `WorkItem`, `RequeueReason` |
-| Failure | Bounded deliveries, jittered exponential backoff, terminal `FAILED`; a stopping worker hands its items back at once, a killed worker's items return when their lease expires | `ItemProcessor`, `RetryPolicy` |
+| Failure | Bounded deliveries, jittered exponential backoff, terminal `FAILED`; a stopping worker hands its items back at once, a killed worker's items return when their lease expires; a delivery that never reached the downstream system (offer check or store down, status unreadable on a redelivery) is refunded, not spent; a status that cannot be read three times in a row releases the item with an overload signal and never fails it | `ItemProcessor`, `RetryPolicy` |
 | Correctness | Offer pin re-checked at dispatch time; stale leases cannot write | `OfferVerifier`, `ItemStore` |
 
 ## Ports to implement for production
