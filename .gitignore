@@ -1,0 +1,8 @@
+# gstack tooling state (local only)
+.gstack/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.iml
