@@ -18,8 +18,21 @@ import com.tuv.fanout.domain.AttemptId;
  *       SKIPPED_OFFER_CHANGED for an engagement that was in fact updated.</li>
  * </ul>
  * Both methods may throw on transport failure; the outcome is then unknown to the caller.
- * Implementations must bound every call with a timeout: a call that never returns holds a
- * capacity permit for as long as it hangs.
+ * Implementations should still set their own timeouts, which can fail faster and release their
+ * connections properly. The worker nevertheless enforces {@code DispatcherConfig.callTimeout()}
+ * on every call, whatever the adapter does: a call that has not returned by then is interrupted
+ * and treated as one that threw, so a submit has an unknown outcome and a status is unreadable.
+ *
+ * <p>Known residuals: a call that ignores interruption keeps its virtual thread until it
+ * returns, and a submit that is accepted after its deadline still takes effect; it is safe
+ * only because the next delivery reuses the same idempotency key. The deadline includes
+ * scheduling delay, not only the call's own time. An adapter that blocks while pinning its
+ * carrier thread (inside {@code synchronized} on JDK 21, or in native I/O) can starve other
+ * virtual threads. Abandoned calls are not counted against any capacity permit. The same
+ * holds for the item store: a {@code leaseNext} that commits after its deadline leaves an item
+ * leased until the lease expires and has spent one of its deliveries, so a store that is
+ * persistently slower than the call timeout can exhaust an item's delivery budget without an
+ * attempt; adapters should enforce a shorter statement timeout that rolls back.
  *
  * <p>The downstream system stays the last line of defence for the pin: it must reject a
  * command whose version is no longer applicable, because the worker's own offer check and

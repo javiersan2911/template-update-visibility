@@ -14,6 +14,20 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Global concurrency limit adapted by additive increase / multiplicative decrease, plus a
  * cap per firm so one large firm cannot occupy the whole pool.
  *
+ * <p>A firm may hold at most the smaller of its adaptive cap and its fair share of the
+ * current global limit, {@code max(1, ceil(limit / contendingFirms))}, where the caller
+ * says how many firms currently have work to dispatch. Without the share, a firm whose items
+ * hang would take every slot the others free, because the scheduler only decides who is
+ * offered the next slot and a slot held by a hung item is never freed.
+ *
+ * <p>The share is not work-conserving. A firm whose items are all leased, or that has no work,
+ * leaves the contending count and the others then get the whole limit. But the count includes
+ * every firm with dispatchable work, also one that is cooling off or whose adaptive cap is
+ * penalised, so slots can sit idle while such a firm cannot use its share. And a share that
+ * shrinks because a second firm appeared never revokes permits already held: a firm that was
+ * alone can hold the whole pool until its items end, and the newcomer waits for them to drain.
+ * The firm above its share simply gets no new slot until it is back under it.
+ *
  * <p>Signals are scoped. A 429 ({@link #recordOverload}) is global: the limit is halved, at
  * most once per decrease cooldown. Trouble attributable to one firm's work
  * ({@link #recordFirmTrouble}) halves only that firm's cap, at most once per cooldown per
@@ -70,9 +84,13 @@ public final class AimdCapacityLimiter implements CapacityLimiter {
     }
 
     @Override
-    public synchronized Optional<Permit> tryAcquire(FirmId firmId) {
+    public synchronized Optional<Permit> tryAcquire(FirmId firmId, int contendingFirms) {
+        if (contendingFirms < 1) {
+            throw new IllegalArgumentException("contending firms must be at least 1");
+        }
         int firmInFlight = inFlightByFirm.getOrDefault(firmId, 0);
-        if (inFlight >= limit || firmInFlight >= capOf(firmId) || isPaused()) {
+        int firmLimit = Math.min(capOf(firmId), fairShare(contendingFirms));
+        if (inFlight >= limit || firmInFlight >= firmLimit || isPaused()) {
             return Optional.empty();
         }
         inFlight++;
@@ -114,6 +132,11 @@ public final class AimdCapacityLimiter implements CapacityLimiter {
             pausedUntil = resumeAt;
         }
         decreaseGlobally(now);
+    }
+
+    /** The firm's equal part of the current global limit, rounded up so the shares together cover it. */
+    private int fairShare(int contendingFirms) {
+        return Math.max(1, Math.ceilDiv(limit, contendingFirms));
     }
 
     /** The cap currently applied to the firm: its full cap unless it is being held back. */

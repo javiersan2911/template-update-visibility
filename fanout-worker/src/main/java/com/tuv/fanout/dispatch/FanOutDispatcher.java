@@ -34,6 +34,11 @@ import java.util.concurrent.TimeUnit;
  * each consecutive failure, and passed over in the rotation, so one broken firm cannot
  * stall the rest.
  *
+ * <p>Every store call the dispatcher makes runs under the configured call timeout, so a hung
+ * store cannot block the admission thread, and so {@link #close()} cannot wait for ever. A
+ * lease call that times out is treated like one that threw; a timed-out
+ * {@code firmsWithDispatchableItems} fails the pass, which is retried after a backoff.
+ *
  * <p>The dispatcher keeps no state of its own that matters. Killing it at any point loses
  * nothing: leases expire and another instance continues with the same idempotency keys.
  *
@@ -53,12 +58,16 @@ public final class FanOutDispatcher implements AutoCloseable {
     /** How long {@code close()} waits, after interrupting workers, for their hand-backs. */
     private static final Duration HAND_BACK_WAIT = Duration.ofSeconds(10);
 
+    /** Added to the call timeout to bound how long {@code close()} waits for the dispatch thread. */
+    static final Duration DISPATCH_JOIN_MARGIN = Duration.ofSeconds(1);
+
     private final ItemLeasing store;
     private final FairScheduler scheduler;
     private final CapacityLimiter limiter;
     private final ItemProcessor processor;
     private final DispatcherConfig config;
     private final Clock clock;
+    private final BoundedCalls calls;
 
     /** Touched by the dispatcher thread only. */
     private final Map<FirmId, CoolOff> coolOffs = new HashMap<>();
@@ -83,6 +92,7 @@ public final class FanOutDispatcher implements AutoCloseable {
         this.processor = Objects.requireNonNull(processor, "processor");
         this.config = Objects.requireNonNull(config, "config");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.calls = new BoundedCalls(config.callTimeout());
     }
 
     public synchronized void start() {
@@ -108,6 +118,10 @@ public final class FanOutDispatcher implements AutoCloseable {
      * another worker can resume it at once under the same idempotency key. {@code close()}
      * then waits a further fixed 10 seconds for those hand-backs to complete, and logs a
      * warning if some did not; their items are then left to lease expiry.
+     *
+     * <p>The wait for the dispatch thread is bounded by the call timeout plus a small margin,
+     * because every call that thread makes is bounded. If the thread is still alive after
+     * that, it is interrupted, a warning is logged, and the workers are shut down anyway.
      */
     @Override
     public synchronized void close() {
@@ -116,7 +130,7 @@ public final class FanOutDispatcher implements AutoCloseable {
         wakeUps.release();
         try {
             if (dispatchThread != null) {
-                dispatchThread.join();
+                joinDispatchThread();
             }
             workers.shutdown();
             if (!workers.awaitTermination(config.shutdownGrace().toMillis(), TimeUnit.MILLISECONDS)) {
@@ -126,6 +140,26 @@ public final class FanOutDispatcher implements AutoCloseable {
         } catch (InterruptedException e) {
             workers.shutdownNow();
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Every call the dispatch thread makes is bounded by the call timeout, so a pass ends
+     * within about that long once {@code running} is false. A thread still alive after that
+     * is stuck somewhere else (for example in the scheduler): it is interrupted and left, and
+     * the workers are shut down regardless.
+     */
+    private void joinDispatchThread() throws InterruptedException {
+        Duration patience = config.callTimeout();
+        try {
+            patience = patience.plus(DISPATCH_JOIN_MARGIN);
+        } catch (ArithmeticException tooLong) {
+            // keep the configured timeout itself
+        }
+        if (!dispatchThread.join(patience)) {
+            LOG.log(Level.WARNING, "The dispatch thread did not stop within " + patience
+                    + "; interrupting it and shutting the workers down regardless");
+            dispatchThread.interrupt();
         }
     }
 
@@ -196,7 +230,8 @@ public final class FanOutDispatcher implements AutoCloseable {
      */
     private boolean dispatchPass() {
         Instant now = clock.instant();
-        Set<FirmId> firms = store.firmsWithDispatchableItems(now);
+        Set<FirmId> firms =
+                calls.call("store.firmsWithDispatchableItems", () -> store.firmsWithDispatchableItems(now));
         coolOffs.keySet().retainAll(firms);
         boolean started = false;
         for (FirmId firm : scheduler.order(firms)) {
@@ -204,14 +239,15 @@ public final class FanOutDispatcher implements AutoCloseable {
                 break;
             }
             if (!isCoolingOff(firm, now)) {
-                started |= tryStart(firm);
+                // firms.size() includes firms cooling off, so a firm's share does not swell while one is away
+                started |= tryStart(firm, firms.size());
             }
         }
         return started;
     }
 
-    private boolean tryStart(FirmId firm) {
-        Optional<Permit> acquired = limiter.tryAcquire(firm);
+    private boolean tryStart(FirmId firm, int contendingFirms) {
+        Optional<Permit> acquired = limiter.tryAcquire(firm, contendingFirms);
         if (acquired.isEmpty()) {
             return false;
         }
@@ -221,9 +257,15 @@ public final class FanOutDispatcher implements AutoCloseable {
         try {
             Optional<Lease> lease;
             try {
-                lease = store.leaseNext(firm, clock.instant(), config.leaseDuration());
+                Instant leaseAt = clock.instant();
+                lease = calls.call("store.leaseNext", () -> store.leaseNext(firm, leaseAt, config.leaseDuration()));
             } catch (RuntimeException e) {
-                coolOff(firm, e);
+                coolOff(firm, "Leasing failed for firm " + firm, e);
+                scheduler.served(firm);
+                return false;
+            }
+            if (lease.isPresent() && !lease.get().item().firmId().equals(firm)) {
+                coolOff(firm, foreignLeaseText(firm, lease.get()), null);
                 scheduler.served(firm);
                 return false;
             }
@@ -254,6 +296,16 @@ public final class FanOutDispatcher implements AutoCloseable {
         }
     }
 
+    /**
+     * Names the item and both firms, not the record. Like {@link #notStartedText}, it says the item is
+     * left to lease expiry, since the dispatcher holds only the leasing view of the store.
+     */
+    private static String foreignLeaseText(FirmId asked, Lease lease) {
+        return "The store answered a lease request for firm " + asked + " with item " + lease.item().id()
+                + " of firm " + lease.item().firmId() + "; it was not run and will be redelivered after its"
+                + " lease expires";
+    }
+
     private static String notStartedText(Lease lease) {
         return "Item " + lease.item().id() + " was leased but could not be started; it will be"
                 + " redelivered after its lease expires";
@@ -279,13 +331,21 @@ public final class FanOutDispatcher implements AutoCloseable {
         return coolOff != null && now.isBefore(coolOff.notBefore());
     }
 
-    /** Skips the firm until a not-before instant; the delay doubles with each consecutive failure. */
-    private void coolOff(FirmId firm, RuntimeException cause) {
+    /**
+     * Skips the firm until a not-before instant; the delay doubles with each consecutive failure.
+     *
+     * @param cause what was thrown, or null when the store answered but the answer was refused
+     */
+    private void coolOff(FirmId firm, String problem, RuntimeException cause) {
         int failures = coolOffs.containsKey(firm) ? coolOffs.get(firm).failures() + 1 : 1;
         Duration delay = backoffDelay(config.idleDelay(), failures);
         coolOffs.put(firm, new CoolOff(failures, clock.instant().plus(delay)));
-        LOG.log(Level.WARNING, "Leasing failed for firm " + firm + " (" + failures
-                + " consecutive); skipping it for " + delay, cause);
+        String text = problem + " (" + failures + " consecutive); skipping it for " + delay;
+        if (cause == null) {
+            LOG.log(Level.WARNING, text);
+        } else {
+            LOG.log(Level.WARNING, text, cause);
+        }
     }
 
     /**

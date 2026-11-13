@@ -49,6 +49,17 @@ class AimdConfigTest {
     }
 
     @Test
+    void aPerFirmCapAboveTheCeilingIsRejectedBecauseNoFirmCouldEverUseIt() {
+        assertThatIllegalArgumentException().isThrownBy(() -> new AimdConfig(
+                10, 100, 10, 101, 5, Duration.ofMinutes(5), 0.5, Duration.ofMinutes(1)))
+                .withMessageContaining("per-firm cap");
+        assertThatIllegalArgumentException().isThrownBy(() -> AimdConfig.fixed(4, 5));
+        assertThat(new AimdConfig(10, 100, 10, 100, 5, Duration.ofMinutes(5), 0.5, Duration.ofMinutes(1))
+                .perFirmCap()).isEqualTo(100);
+        assertThat(AimdConfig.fixed(4, 4).perFirmCap()).isEqualTo(4);
+    }
+
+    @Test
     void negativeIntervalsAreRejected() {
         assertThatIllegalArgumentException().isThrownBy(() -> new AimdConfig(
                 10, 100, 10, 50, 5, Duration.ofSeconds(-1), 0.5, Duration.ofMinutes(1), Duration.ofMinutes(1)));

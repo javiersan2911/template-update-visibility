@@ -88,6 +88,44 @@ class IdentityTest {
                 () -> ItemId.of(FIRM, new VersionPin("a@1/b", 2), new EngagementId("c")));
     }
 
+    static Stream<String> malformedItemIds() {
+        return Stream.of(
+                "", " ", "a", "a/b", "a/b@1", "a@1/b", "a/b/c", "a/b@x/c", "a/b@/c", "a/b@-1/c", "a/b@+1/c",
+                "a/b@01/c", "a/b@1@2/c", "a/b@1/c/d", "/b@1/c", "a/@1/c", "a/b@1/", "a//b@1/c",
+                "a/b@99999999999999999999/c", "a/b@9223372036854775808/c", "a/b@\u0661/c",
+                "a/b@1/c\n", "a/b@1/c\r\nINFO forged", "a/b@1/c\u0000", "a/b\t@1/c", "a /b@1/c",
+                "a/b@1/c\u202e", "a/b@1/caf\u00e9", "a/b@1/c#1",
+                "x".repeat(129) + "/b@1/c", "a/" + "x".repeat(129) + "@1/c", "a/b@1/" + "x".repeat(129),
+                "a/b@1/c" + " ".repeat(10_000));
+    }
+
+    @ParameterizedTest(name = "[{index}]")
+    @MethodSource("malformedItemIds")
+    void anItemIdMustBeTheJoinedFormOfThreeValidPartsAndNeverEchoesARejectedValue(String value) {
+        assertThatIllegalArgumentException().isThrownBy(() -> new ItemId(value))
+                .withMessageContaining("item id")
+                .satisfies(e -> {
+                    if (value.length() > 3) {
+                        assertThat(e.getMessage()).doesNotContain(value);
+                    }
+                });
+    }
+
+    @Test
+    void aNullItemIdIsRejected() {
+        assertThatIllegalArgumentException().isThrownBy(() -> new ItemId(null)).withMessageContaining("item id");
+    }
+
+    @Test
+    void anItemIdAtTheLongestAllowedPartsAndTheLargestSequenceIsAccepted() {
+        String longest = "f".repeat(128) + "/" + "p".repeat(128) + "@" + Long.MAX_VALUE + "/" + "e".repeat(128);
+
+        assertThat(new ItemId(longest).value()).isEqualTo(longest);
+        assertThat(ItemId.of(new FirmId("f".repeat(128)), new VersionPin("p".repeat(128), Long.MAX_VALUE),
+                new EngagementId("e".repeat(128)))).isEqualTo(new ItemId(longest));
+        assertThat(new ItemId("a/b@0/c").value()).isEqualTo("a/b@0/c");
+    }
+
     @Test
     void aVersionPinStillRejectsANegativeSequence() {
         assertThatIllegalArgumentException().isThrownBy(() -> new VersionPin("audit", -1));

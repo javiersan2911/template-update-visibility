@@ -29,6 +29,8 @@ import com.tuv.fanout.port.OfferVerifier;
 import com.tuv.fanout.port.SubmitResult;
 import com.tuv.fanout.support.FakeEngagementGateway;
 import com.tuv.fanout.support.FakeEngagementGateway.Behavior;
+import com.tuv.fanout.support.HangingGateway;
+import com.tuv.fanout.support.HangingGateway.Hang;
 import com.tuv.fanout.support.InMemoryItemStore;
 import com.tuv.fanout.support.LogCapture;
 import com.tuv.fanout.support.MutableClock;
@@ -43,7 +45,9 @@ import java.util.List;
 import java.util.logging.Level;
 import java.util.stream.Stream;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -66,14 +70,25 @@ class ItemProcessorTest {
             Duration.ofMillis(2),
             Duration.ofSeconds(5),
             Duration.ofMillis(5),
-            Duration.ofSeconds(5));
+            Duration.ofSeconds(5),
+            Duration.ofSeconds(10));
     /** Only for tests that need an attempt to time out. */
     private static final DispatcherConfig SHORT_TIMEOUT_CONFIG = new DispatcherConfig(
             Duration.ofSeconds(30),
             Duration.ofMillis(2),
             Duration.ofMillis(80),
             Duration.ofMillis(5),
-            Duration.ofSeconds(5));
+            Duration.ofSeconds(5),
+            Duration.ofSeconds(10));
+
+    /** Calls are abandoned after 50 ms; for the tests of a port that never answers. */
+    private static final DispatcherConfig SHORT_CALL_CONFIG = new DispatcherConfig(
+            Duration.ofSeconds(30),
+            Duration.ofMillis(2),
+            Duration.ofSeconds(5),
+            Duration.ofMillis(5),
+            Duration.ofSeconds(5),
+            Duration.ofMillis(50));
 
     private final MutableClock clock = new MutableClock();
     private final InMemoryItemStore store = new InMemoryItemStore();
@@ -1027,6 +1042,325 @@ class ItemProcessorTest {
                 assertThat(entry.thrown()).isSameAs(fatal);
             });
         }
+    }
+
+    // ---- every port call runs under the call timeout ----
+
+    private ItemProcessor processorWithShortCallTimeout(EngagementGateway downstream, OfferVerifier offerVerifier) {
+        RetryPolicy noDelay = new RetryPolicy(MAX_DELIVERIES, Duration.ZERO, Duration.ZERO, new Random(1));
+        return processor(store, downstream, offerVerifier, noDelay, SHORT_CALL_CONFIG);
+    }
+
+    @Test
+    void aStatusReadThatNeverReturnsIsUnreadableSoTheItemIsRequeuedAsOutcomeUnknownUnderTheSameKey() {
+        HangingGateway hanging = new HangingGateway(gateway, Hang.STATUS, true);
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            deliver(processorWithShortCallTimeout(hanging, (engagementId, pin) -> true));
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::thrown)
+                    .anySatisfy(thrown -> assertThat(thrown).isInstanceOf(CallTimeoutException.class)
+                            .hasMessageContaining("gateway.status"));
+        } finally {
+            hanging.release();
+        }
+
+        assertThat(hanging.statusCalls()).as("three unreadable reads in a row").isEqualTo(3);
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM)).as("outcome unknown: same key, delivery spent")
+                .extracting(WorkItem::attemptNumber, WorkItem::deliveryCount).containsExactly(1, 1);
+        assertThat(feedback.troubleFirms()).containsExactly(FIRM);
+    }
+
+    @Test
+    void aSubmitThatNeverReturnsIsTreatedAsPossiblySubmittedAndTheNextDeliveryReusesTheKey() {
+        HangingGateway hanging = new HangingGateway(gateway, Hang.SUBMIT, true);
+        Lease first = leaseItem();
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            processorWithShortCallTimeout(hanging, (engagementId, pin) -> true).process(first);
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::thrown)
+                    .anySatisfy(thrown -> assertThat(thrown).isInstanceOf(CallTimeoutException.class)
+                            .hasMessageContaining("gateway.submit"));
+        } finally {
+            hanging.release();
+        }
+
+        assertThat(hanging.submittedKeys()).containsExactly(first.item().attemptId());
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM)).as("not a refund, which would say nothing was attempted")
+                .extracting(WorkItem::attemptNumber, WorkItem::deliveryCount).containsExactly(1, 1);
+        assertThat(feedback.troubleFirms()).containsExactly(FIRM);
+
+        deliverAgain(processor());
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(gateway.submittedAttemptIds(ENGAGEMENT)).containsExactly(first.item().attemptId());
+    }
+
+    @Test
+    void anOfferCheckThatNeverReturnsMeansNothingWasSubmittedAndTheDeliveryIsRefunded() {
+        CountDownLatch release = new CountDownLatch(1);
+        OfferVerifier hanging = (engagementId, pin) -> {
+            boolean interrupted = false;
+            while (release.getCount() > 0) {
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            throw new IllegalStateException("released after the deadline");
+        };
+
+        try {
+            deliver(processorWithShortCallTimeout(gateway, hanging));
+        } finally {
+            release.countDown();
+        }
+
+        assertThat(gateway.submissionCount()).isZero();
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM).deliveryCount()).as("refunded").isZero();
+        assertThat(feedback.troubleFirms()).isEmpty();
+    }
+
+    @Test
+    void anExceptionFromAPortCallReachesTheExistingHandlingAsItself() {
+        IllegalStateException connectionReset = new IllegalStateException("connection reset");
+        EngagementGateway failing = new EngagementGateway() {
+            @Override
+            public SubmitResult submit(ApplyCommand command) {
+                throw connectionReset;
+            }
+
+            @Override
+            public AttemptStatus status(AttemptId attemptId) {
+                return AttemptStatus.NOT_FOUND;
+            }
+        };
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            deliver(processor(store, failing, (engagementId, pin) -> true));
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::thrown)
+                    .anySatisfy(thrown -> assertThat(thrown).isSameAs(connectionReset));
+        }
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(feedback.troubleFirms()).containsExactly(FIRM);
+    }
+
+    @Test
+    void aWorkerInterruptedInsideASubmitThatIsBlockedHandsTheItemBackAndCancelsTheCall() throws InterruptedException {
+        HangingGateway hanging = new HangingGateway(gateway, Hang.SUBMIT, false);
+        store.enqueue(List.of(WorkItem.create(FIRM, ENGAGEMENT, PIN)));
+        store.leaseNext(FIRM, clock.instant(), Duration.ZERO).orElseThrow();
+        Lease lease = store.leaseNext(FIRM, clock.instant(), CONFIG.leaseDuration()).orElseThrow();
+        assertThat(lease.item().deliveryCount()).isEqualTo(2);
+        InterruptSensitiveWriter writer = new InterruptSensitiveWriter(store);
+        ItemProcessor processor = processor(writer, hanging, (engagementId, pin) -> true);
+        AtomicBoolean flagAfterwards = new AtomicBoolean();
+        AtomicReference<Throwable> escaped = new AtomicReference<>();
+        Thread worker = Thread.ofPlatform().start(() -> {
+            try {
+                processor.process(lease);
+            } catch (Throwable t) {
+                escaped.set(t);
+            }
+            flagAfterwards.set(Thread.currentThread().isInterrupted());
+        });
+        try {
+            assertThat(hanging.awaitEntered()).as("the submit is under way").isTrue();
+
+            worker.interrupt();
+            worker.join(20_000);
+
+            assertThat(worker.isAlive()).isFalse();
+            assertThat(escaped.get()).isNull();
+            assertThat(hanging.awaitInterrupted()).as("the blocked call was cancelled").isTrue();
+        } finally {
+            hanging.release();
+        }
+
+        assertThat(flagAfterwards).as("interrupt flag is restored").isTrue();
+        assertThat(store.statusOf(ITEM)).as("handed back, not failed").isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM).deliveryCount()).as("the delivery was refunded by the hand-back").isEqualTo(1);
+        assertThat(store.itemOf(ITEM).attemptNumber()).isEqualTo(1);
+        assertThat(writer.requeueSawInterruptFlag).isFalse();
+        assertThat(feedback.troubleFirms()).isEmpty();
+    }
+
+    // ---- a shutdown interrupt inside a bounded call is a hand-back, whichever call it lands in ----
+
+    /** Delivery 2 of the item, so that a hand-back (count 2 to 1, deferrals kept) differs from every other requeue. */
+    private Lease secondDeliveryAfterASubmitThatIsStillRunning() {
+        gateway.script(ENGAGEMENT, HANG);
+        store.enqueue(List.of(WorkItem.create(FIRM, ENGAGEMENT, PIN)));
+        Lease crashed = store.leaseNext(FIRM, clock.instant(), Duration.ZERO).orElseThrow();
+        gateway.submit(ApplyCommand.forItem(crashed.item()));
+        return store.leaseNext(FIRM, clock.instant(), CONFIG.leaseDuration()).orElseThrow();
+    }
+
+    private Lease secondDeliveryWhoseEarlierAttemptWasNeverSeen() {
+        store.enqueue(List.of(WorkItem.create(FIRM, ENGAGEMENT, PIN)));
+        store.leaseNext(FIRM, clock.instant(), Duration.ZERO).orElseThrow();
+        return store.leaseNext(FIRM, clock.instant(), CONFIG.leaseDuration()).orElseThrow();
+    }
+
+    /**
+     * Runs the processor on its own thread, interrupts that thread once the port call is blocked, and
+     * returns whether the thread still had its interrupt flag set when {@code process} returned.
+     */
+    private static boolean interruptWhileBlocked(
+            ItemProcessor processor, Lease lease, java.util.concurrent.Callable<Boolean> blocked) throws Exception {
+        AtomicBoolean flagAfterwards = new AtomicBoolean();
+        AtomicReference<Throwable> escaped = new AtomicReference<>();
+        Thread worker = Thread.ofPlatform().start(() -> {
+            try {
+                processor.process(lease);
+            } catch (Throwable t) {
+                escaped.set(t);
+            }
+            flagAfterwards.set(Thread.currentThread().isInterrupted());
+        });
+        try {
+            assertThat(blocked.call()).as("the port call is under way").isTrue();
+            worker.interrupt();
+            worker.join(20_000);
+            assertThat(worker.isAlive()).isFalse();
+            assertThat(escaped.get()).isNull();
+        } finally {
+            worker.interrupt();
+        }
+        return flagAfterwards.get();
+    }
+
+    /** What HANDED_BACK gives delivery 2: back in the queue, delivery refunded, nothing else touched. */
+    private void assertHandedBackFromDeliveryTwo(boolean flagAfterwards) {
+        assertThat(flagAfterwards).as("the interrupt flag is left set for the caller").isTrue();
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM)).extracting(WorkItem::attemptNumber, WorkItem::deliveryCount, WorkItem::deferrals)
+                .as("attempt number, delivery count, deferrals").containsExactly(1, 1, 0);
+        assertThat(feedback.troubleFirms()).isEmpty();
+    }
+
+    /** Blocks until interrupted, which the bounded call does when the waiting thread is interrupted. */
+    private static final class Blocker {
+
+        private final CountDownLatch entered = new CountDownLatch(1);
+
+        void block() {
+            entered.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException e) {
+                throw new IllegalStateException("interrupted while blocked", e);
+            }
+        }
+
+        boolean awaitEntered() throws InterruptedException {
+            return entered.await(20, java.util.concurrent.TimeUnit.SECONDS);
+        }
+    }
+
+    /** Blocks the first {@code renew}; everything else goes to the store. */
+    private static final class BlockingRenew implements LeaseWriter {
+
+        private final LeaseWriter delegate;
+        private final Blocker blocker = new Blocker();
+        private final AtomicBoolean blocked = new AtomicBoolean();
+
+        private BlockingRenew(LeaseWriter delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public boolean renew(Lease lease, Instant newExpiry) {
+            if (blocked.compareAndSet(false, true)) {
+                blocker.block();
+            }
+            return delegate.renew(lease, newExpiry);
+        }
+
+        @Override
+        public boolean finish(Lease lease, ItemStatus terminalStatus, String detail) {
+            return delegate.finish(lease, terminalStatus, detail);
+        }
+
+        @Override
+        public boolean requeue(Lease lease, RequeueReason reason, Instant notBefore) {
+            return delegate.requeue(lease, reason, notBefore);
+        }
+    }
+
+    @Test
+    void anInterruptWhileTheOfferCheckIsBlockedHandsTheItemBackInsteadOfDeferringIt() throws Exception {
+        Blocker blocker = new Blocker();
+        Lease lease = secondDeliveryWhoseEarlierAttemptWasNeverSeen();
+        ItemProcessor processor = processor((engagementId, pin) -> {
+            blocker.block();
+            return true;
+        });
+
+        boolean flag = interruptWhileBlocked(processor, lease, blocker::awaitEntered);
+
+        assertHandedBackFromDeliveryTwo(flag);
+        assertThat(gateway.submissionCount()).isZero();
+    }
+
+    @Test
+    void anInterruptWhileTheLeaseRenewalBeforeTheSubmitIsBlockedHandsTheItemBack() throws Exception {
+        BlockingRenew writer = new BlockingRenew(store);
+        Lease lease = secondDeliveryWhoseEarlierAttemptWasNeverSeen();
+        ItemProcessor processor = processor(writer, gateway, (engagementId, pin) -> true);
+
+        boolean flag = interruptWhileBlocked(processor, lease, writer.blocker::awaitEntered);
+
+        assertHandedBackFromDeliveryTwo(flag);
+        assertThat(gateway.submissionCount()).isZero();
+    }
+
+    @Test
+    void anInterruptWhileTheRenewalInsideTheWaitIsBlockedHandsTheItemBackInsteadOfCountingAnUnexpectedFailure()
+            throws Exception {
+        BlockingRenew writer = new BlockingRenew(store);
+        Lease lease = secondDeliveryAfterASubmitThatIsStillRunning();
+        ItemProcessor processor = processor(writer, gateway, (engagementId, pin) -> true);
+
+        boolean flag;
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            flag = interruptWhileBlocked(processor, lease, writer.blocker::awaitEntered);
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::message)
+                    .noneSatisfy(message -> assertThat(message).contains("Unexpected failure"));
+        }
+
+        assertHandedBackFromDeliveryTwo(flag);
+        assertThat(gateway.submissionCount()).as("the earlier delivery's submit only").isEqualTo(1);
+    }
+
+    @Test
+    void anInterruptWhileAStatusReadIsBlockedIsNotAnUnreadableStatusAndHandsTheItemBack() throws Exception {
+        HangingGateway hanging = new HangingGateway(gateway, Hang.STATUS, false);
+        Lease lease = secondDeliveryWhoseEarlierAttemptWasNeverSeen();
+        ItemProcessor processor = processor(store, hanging, (engagementId, pin) -> true);
+
+        boolean flag;
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            flag = interruptWhileBlocked(processor, lease, hanging::awaitEntered);
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::message)
+                    .noneSatisfy(message -> assertThat(message).contains("Status read failed"));
+        }
+
+        assertHandedBackFromDeliveryTwo(flag);
+        assertThat(hanging.statusCalls()).as("no further reads once interrupted").isEqualTo(1);
+        assertThat(hanging.submittedKeys()).isEmpty();
     }
 
     // ---- delivery budget, lower side ----
