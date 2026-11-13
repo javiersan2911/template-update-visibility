@@ -20,6 +20,9 @@ public interface LeaseWriter {
     /**
      * Moves the item to a terminal status.
      *
+     * @param detail a single line of free text for people, at most 500 characters (the
+     *               worker truncates longer text with an ellipsis and replaces control
+     *               characters, newlines included, with spaces before it gets here)
      * @throws IllegalArgumentException if the status is not terminal
      */
     boolean finish(Lease lease, ItemStatus terminalStatus, String detail);

@@ -1,6 +1,7 @@
 package com.tuv.fanout.dispatch;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 
 import com.tuv.fanout.domain.EngagementId;
 import com.tuv.fanout.domain.FirmId;
@@ -9,10 +10,14 @@ import com.tuv.fanout.domain.VersionPin;
 import com.tuv.fanout.port.FanOutSource;
 import com.tuv.fanout.port.FanOutSource.Target;
 import com.tuv.fanout.support.InMemoryItemStore;
+import com.tuv.fanout.support.LogCapture;
+import java.util.logging.Level;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class PublishFanOutTest {
 
@@ -72,5 +77,33 @@ class PublishFanOutTest {
         assertThat(fanOut.onPublished(PIN)).isEqualTo(2);
 
         assertThat(store.size()).isEqualTo(2);
+    }
+
+    @ParameterizedTest(name = "batch size {0}")
+    @ValueSource(ints = {0, -1, 10_001, Integer.MAX_VALUE})
+    void aBatchSizeOutsideOneToTenThousandIsRejected(int batchSize) {
+        assertThatIllegalArgumentException().isThrownBy(() -> new PublishFanOut(pin -> targets(1), store, batchSize))
+                .withMessageContaining("10000");
+    }
+
+    @ParameterizedTest(name = "batch size {0}")
+    @ValueSource(ints = {1, 10_000})
+    void theBoundsOfTheBatchSizeAreAccepted(int batchSize) {
+        assertThat(new PublishFanOut(pin -> targets(3), store, batchSize).onPublished(PIN)).isEqualTo(3);
+    }
+
+    @Test
+    void logsOncePerPublishAtInfoWhichPinWasFannedOutAndHowManyItemsWereCreated() {
+        PublishFanOut fanOut = new PublishFanOut(pin -> targets(25), store, 10);
+        try (LogCapture log = LogCapture.of(PublishFanOut.class)) {
+            fanOut.onPublished(PIN);
+            fanOut.onPublished(PIN);
+
+            assertThat(log.entries()).as("one line per publish, none per batch").hasSize(2)
+                    .allSatisfy(entry -> assertThat(entry.level()).isEqualTo(Level.INFO));
+            assertThat(log.entries().get(0).message()).contains("audit@7").contains("25");
+            assertThat(log.entries().get(1).message()).as("a redelivered event created nothing")
+                    .contains("audit@7").contains(" 0 ");
+        }
     }
 }

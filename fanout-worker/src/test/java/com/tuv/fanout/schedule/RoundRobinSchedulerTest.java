@@ -35,8 +35,51 @@ class RoundRobinSchedulerTest {
 
     @Test
     void aFirmThatJoinsLaterIsNotPutBehindTheWholeQueue() {
+        assertThat(scheduler.order(Set.of(A, B))).containsExactly(A, B);
+        scheduler.served(A);
+        scheduler.served(B);
+
+        assertThat(scheduler.order(Set.of(A, B, C))).as("C joined: it is next, ahead of A and B")
+                .containsExactly(C, A, B);
+    }
+
+    @Test
+    void aFirmThatJoinsLaterAndSortsBeforeTheCursorWaitsOnlyForTheFirmsAheadOfIt() {
         scheduler.served(C);
 
-        assertThat(scheduler.order(Set.of(A, B, C))).containsExactly(A, B, C);
+        assertThat(scheduler.order(Set.of(A, C))).containsExactly(A, C);
+        assertThat(scheduler.order(Set.of(A, B, C))).as("B joined: behind A, ahead of the just-served C")
+                .containsExactly(A, B, C);
+    }
+
+    @Test
+    void noCandidatesMeansAnEmptyOrderBeforeAndAfterAFirmWasServed() {
+        assertThat(scheduler.order(Set.of())).isEmpty();
+        scheduler.served(A);
+
+        assertThat(scheduler.order(Set.of())).isEmpty();
+    }
+
+    @Test
+    void aSingleFirmIsAlwaysNext() {
+        assertThat(scheduler.order(Set.of(B))).containsExactly(B);
+        scheduler.served(B);
+
+        assertThat(scheduler.order(Set.of(B))).containsExactly(B);
+    }
+
+    @Test
+    void aLastServedFirmThatIsNoLongerACandidateStillLeavesTheRotationInPlace() {
+        scheduler.served(C);
+        assertThat(scheduler.order(Set.of(A, B))).as("served firm sorts after every candidate")
+                .containsExactly(A, B);
+
+        scheduler.served(A);
+        assertThat(scheduler.order(Set.of(B, C))).as("served firm sorts before every candidate")
+                .containsExactly(B, C);
+
+        scheduler.served(B);
+        assertThat(scheduler.order(Set.of(A, C))).as("served firm sorts between candidates")
+                .containsExactly(C, A);
     }
 }

@@ -464,4 +464,34 @@ class AimdCapacityLimiterTest {
 
         assertThat(limiter.currentLimit()).isEqualTo(15);
     }
+
+    @Test
+    void aCeilingNearIntegerMaxValueSaturatesInsteadOfOverflowingToANegativeLimit() {
+        AimdCapacityLimiter limiter = new AimdCapacityLimiter(
+                new AimdConfig(1, Integer.MAX_VALUE, Integer.MAX_VALUE - 2, 50, 5, INCREASE_INTERVAL, 0.5,
+                        DECREASE_COOLDOWN),
+                clock);
+        clock.advance(INCREASE_INTERVAL);
+
+        limiter.recordSuccess(FIRM_A);
+
+        assertThat(limiter.currentLimit()).isEqualTo(Integer.MAX_VALUE);
+        assertThat(limiter.hasCapacity()).isTrue();
+        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
+    }
+
+    @Test
+    void aFirmCapAndStepNearIntegerMaxValueRecoverToTheFullCapWithoutOverflowing() {
+        AimdCapacityLimiter limiter = new AimdCapacityLimiter(
+                new AimdConfig(1, 100, 10, Integer.MAX_VALUE, Integer.MAX_VALUE, INCREASE_INTERVAL, 0.5,
+                        DECREASE_COOLDOWN),
+                clock);
+        limiter.recordFirmTrouble(FIRM_A);
+        assertThat(limiter.currentFirmCap(FIRM_A)).isLessThan(Integer.MAX_VALUE).isPositive();
+
+        clock.advance(INCREASE_INTERVAL);
+
+        assertThat(limiter.currentFirmCap(FIRM_A)).isEqualTo(Integer.MAX_VALUE);
+        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
+    }
 }

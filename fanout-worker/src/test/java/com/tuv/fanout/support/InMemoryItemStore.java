@@ -6,7 +6,6 @@ import com.tuv.fanout.domain.ItemStatus;
 import com.tuv.fanout.domain.Lease;
 import com.tuv.fanout.domain.RequeueReason;
 import com.tuv.fanout.domain.WorkItem;
-import com.tuv.fanout.port.ItemStore;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collection;
@@ -17,11 +16,11 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * Reference implementation of the {@link ItemStore} contract. A production store would
+ * Reference implementation of the {@code ItemStore} contract. A production store would
  * express the same transitions as conditional SQL updates ({@code FOR UPDATE SKIP LOCKED}
  * for leasing, {@code WHERE lease_token = ?} for the fenced writes).
  */
-public final class InMemoryItemStore implements ItemStore {
+public final class InMemoryItemStore implements InspectableItemStore {
 
     private final Map<ItemId, Entry> entries = new LinkedHashMap<>();
     private long nextToken = 1;
@@ -83,10 +82,12 @@ public final class InMemoryItemStore implements ItemStore {
         }).orElse(false);
     }
 
+    @Override
     public synchronized ItemStatus statusOf(ItemId id) {
         return entries.get(id).status;
     }
 
+    @Override
     public synchronized WorkItem itemOf(ItemId id) {
         return entries.get(id).item;
     }

@@ -18,6 +18,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
@@ -61,6 +62,8 @@ public final class FanOutDispatcher implements AutoCloseable {
 
     /** Touched by the dispatcher thread only. */
     private final Map<FirmId, CoolOff> coolOffs = new HashMap<>();
+    /** Passes in a row that threw; touched by the dispatcher thread only. */
+    private int consecutivePassFailures;
     private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
     private final Semaphore wakeUps = new Semaphore(0);
     private volatile boolean running;
@@ -88,6 +91,15 @@ public final class FanOutDispatcher implements AutoCloseable {
         }
         running = true;
         dispatchThread = Thread.ofPlatform().name("fanout-dispatcher").start(this::dispatchLoop);
+    }
+
+    /**
+     * Whether the dispatcher is admitting work: true from {@link #start()} until
+     * {@link #close()} is called or the dispatch loop ends, whether on an interrupt or on an
+     * {@link Error}. A supervisor can poll this to notice a dispatcher that died.
+     */
+    public boolean isRunning() {
+        return running;
     }
 
     /**
@@ -124,25 +136,60 @@ public final class FanOutDispatcher implements AutoCloseable {
         }
     }
 
+    /**
+     * Runs passes until stopped. A pass that throws is retried after a growing delay; an
+     * {@link Error} ends the loop, is logged at ERROR with the reason, and propagates, so the
+     * thread never dies silently while {@link #isRunning()} still says true.
+     */
     private void dispatchLoop() {
-        while (running) {
-            try {
-                if (!dispatchPass()) {
-                    waitForWork();
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            } catch (RuntimeException e) {
-                LOG.log(Level.WARNING, "Dispatch pass failed; retrying after the idle delay", e);
-                sleepQuietly();
+        try {
+            while (running) {
+                runOnePass();
             }
+        } catch (InterruptedException e) {
+            LOG.log(Level.INFO, "Dispatcher thread was interrupted; it has stopped admitting work");
+            Thread.currentThread().interrupt();
+        } catch (Throwable t) {
+            LOG.log(Level.ERROR, "Dispatcher has stopped admitting work because of " + t
+                    + "; items already leased return after their leases expire", t);
+            throw t;
+        } finally {
+            running = false;
+        }
+    }
+
+    private void runOnePass() throws InterruptedException {
+        try {
+            boolean started = dispatchPass();
+            consecutivePassFailures = 0;
+            if (!started) {
+                waitForWork();
+            }
+        } catch (RuntimeException e) {
+            backOffAfterFailedPass(e);
         }
     }
 
     /**
+     * The delay doubles with each consecutive failed pass and resets after a pass that does
+     * not throw. Only the first failure of a run logs its stack trace.
+     */
+    private void backOffAfterFailedPass(RuntimeException cause) throws InterruptedException {
+        consecutivePassFailures++;
+        Duration delay = backoffDelay(config.idleDelay(), consecutivePassFailures);
+        if (consecutivePassFailures == 1) {
+            LOG.log(Level.WARNING, "Dispatch pass failed; retrying in " + delay, cause);
+        } else {
+            LOG.log(Level.WARNING, "Dispatch pass failed again (" + consecutivePassFailures
+                    + " consecutive): " + cause + "; retrying in " + delay);
+        }
+        sleepUnlessStopped(delay);
+    }
+
+    /**
      * Offers every firm with work at most one slot, in fair order. A firm whose lease call
-     * fails is skipped for a growing cool-off and never holds up the others.
+     * fails is skipped for a growing cool-off and never holds up the others. The pass ends
+     * early once {@link #close()} has been called, so it starts nothing more.
      *
      * @return whether anything was started; if not, nothing will change until an item
      *         finishes or new work arrives
@@ -153,7 +200,7 @@ public final class FanOutDispatcher implements AutoCloseable {
         coolOffs.keySet().retainAll(firms);
         boolean started = false;
         for (FirmId firm : scheduler.order(firms)) {
-            if (!limiter.hasCapacity()) {
+            if (!running || !limiter.hasCapacity()) {
                 break;
             }
             if (!isCoolingOff(firm, now)) {
@@ -169,28 +216,62 @@ public final class FanOutDispatcher implements AutoCloseable {
             return false;
         }
         Permit permit = acquired.get();
-        Optional<Lease> lease;
+        boolean handedToWorker = false;
+        Lease granted = null;
         try {
-            lease = store.leaseNext(firm, clock.instant(), config.leaseDuration());
-        } catch (RuntimeException e) {
-            permit.close();
-            coolOff(firm, e);
+            Optional<Lease> lease;
+            try {
+                lease = store.leaseNext(firm, clock.instant(), config.leaseDuration());
+            } catch (RuntimeException e) {
+                coolOff(firm, e);
+                scheduler.served(firm);
+                return false;
+            }
+            coolOffs.remove(firm);
+            if (lease.isEmpty()) {
+                return false;
+            }
+            granted = lease.get();
+            Lease item = granted;
             scheduler.served(firm);
-            return false;
-        }
-        coolOffs.remove(firm);
-        if (lease.isEmpty()) {
-            permit.close();
-            return false;
-        }
-        try {
-            scheduler.served(firm);
-            workers.execute(() -> runItem(lease.get(), permit));
+            workers.execute(() -> runItem(item, permit));
+            handedToWorker = true;
             return true;
         } catch (RuntimeException e) {
-            permit.close();
+            if (granted == null) {
+                throw e;
+            }
+            return notStarted(granted, e);
+        } catch (Error e) {
+            if (granted != null) {
+                LOG.log(Level.WARNING, notStartedText(granted), e);
+            }
             throw e;
+        } finally {
+            if (!handedToWorker) {
+                permit.close(); // once runItem owns the permit, it closes it
+            }
         }
+    }
+
+    private static String notStartedText(Lease lease) {
+        return "Item " + lease.item().id() + " was leased but could not be started; it will be"
+                + " redelivered after its lease expires";
+    }
+
+    /**
+     * The item is leased but nothing runs it, and this class holds only the leasing view of
+     * the store, so it cannot hand the item back: it is named here and comes back when its
+     * lease expires. A refusal by the executor while closing is expected and not a failed
+     * pass; anything else still fails the pass.
+     */
+    private boolean notStarted(Lease lease, RuntimeException cause) {
+        if (cause instanceof RejectedExecutionException && !running) {
+            LOG.log(Level.WARNING, notStartedText(lease) + " (the dispatcher is shutting down)");
+            return false;
+        }
+        LOG.log(Level.WARNING, notStartedText(lease), cause);
+        throw cause;
     }
 
     private boolean isCoolingOff(FirmId firm, Instant now) {
@@ -201,13 +282,26 @@ public final class FanOutDispatcher implements AutoCloseable {
     /** Skips the firm until a not-before instant; the delay doubles with each consecutive failure. */
     private void coolOff(FirmId firm, RuntimeException cause) {
         int failures = coolOffs.containsKey(firm) ? coolOffs.get(firm).failures() + 1 : 1;
-        Duration delay = config.idleDelay().multipliedBy(1L << Math.min(failures - 1, 20));
-        if (delay.compareTo(MAX_COOL_OFF) > 0) {
-            delay = MAX_COOL_OFF;
-        }
+        Duration delay = backoffDelay(config.idleDelay(), failures);
         coolOffs.put(firm, new CoolOff(failures, clock.instant().plus(delay)));
         LOG.log(Level.WARNING, "Leasing failed for firm " + firm + " (" + failures
                 + " consecutive); skipping it for " + delay, cause);
+    }
+
+    /**
+     * The wait after {@code failures} consecutive failures: {@code base}, doubled for each
+     * failure after the first, never more than one minute, and never less than {@code base}
+     * itself: a configured idle delay longer than the cap is the floor, not something to undercut.
+     * Used for the failed-pass backoff and the per-firm cool-off alike.
+     */
+    static Duration backoffDelay(Duration base, int failures) {
+        Duration cap = base.compareTo(MAX_COOL_OFF) > 0 ? base : MAX_COOL_OFF;
+        try {
+            Duration delay = base.multipliedBy(1L << Math.min(failures - 1, 20));
+            return delay.compareTo(cap) > 0 ? cap : delay;
+        } catch (ArithmeticException tooLong) {
+            return cap;
+        }
     }
 
     private record CoolOff(int failures, Instant notBefore) {}
@@ -225,11 +319,15 @@ public final class FanOutDispatcher implements AutoCloseable {
         wakeUps.drainPermits();
     }
 
-    private void sleepQuietly() {
-        try {
-            Thread.sleep(config.idleDelay());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+    /** Waits out the delay, but returns at once when {@link #close()} stops the dispatcher. */
+    private void sleepUnlessStopped(Duration delay) throws InterruptedException {
+        long deadline = System.nanoTime() + delay.toNanos();
+        while (running) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                return;
+            }
+            wakeUps.tryAcquire(remaining, TimeUnit.NANOSECONDS);
         }
     }
 }

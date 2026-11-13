@@ -57,6 +57,14 @@ import java.util.function.Supplier;
  *       submit call itself. Delivery 1 skips the status poll, which is safe only because a
  *       count of 1 means nothing was ever submitted.</li>
  *   <li>An unreadable status is not a verdict: it never fails an item that was submitted.</li>
+ *   <li>A status endpoint may lag the submit. After a submit accepted in this delivery,
+ *       NOT_FOUND counts as "still running" for the first few reads in a row; only a longer
+ *       run of them means the submit was lost. A delivery that did not submit gets no such
+ *       grace: for it, NOT_FOUND means the earlier delivery never reached the downstream system.</li>
+ *   <li>Every write to the store is checked. A {@code false} means the lease was lost and
+ *       nothing was written; it is logged, and nothing that follows a successful write
+ *       (such as reporting a success to the capacity feedback) is done.</li>
+ *   <li>The detail stored with a terminal status is one line of at most 500 characters.</li>
  * </ul>
  */
 public final class ItemProcessor {
@@ -65,6 +73,14 @@ public final class ItemProcessor {
 
     /** Unreadable status reads in a row after which a delivery stops waiting. */
     private static final int MAX_CONSECUTIVE_STATUS_FAILURES = 3;
+
+    /** NOT_FOUND reads in a row, right after this delivery's accepted submit, that are still read as "running". */
+    private static final int NOT_FOUND_GRACE_READS = 3;
+
+    /** Longest detail stored with a terminal status, ellipsis included; see {@code LeaseWriter.finish}. */
+    private static final int MAX_DETAIL_LENGTH = 500;
+
+    private static final String ELLIPSIS = "\u2026";
 
     private final LeaseWriter store;
     private final EngagementGateway gateway;
@@ -94,11 +110,22 @@ public final class ItemProcessor {
     }
 
     /**
-     * Never throws. An interrupt hands the item back so another worker can resume it. The
-     * hand-back is made first and the interrupt flag restored afterwards, so a store client
-     * that fails fast on an interrupted thread is not sabotaged.
+     * Throws nothing but an {@link Error}, which is logged with the item and rethrown. An
+     * interrupt hands the item back so another worker can resume it. The hand-back is made
+     * first and the interrupt flag restored afterwards, so a store client that fails fast on
+     * an interrupted thread is not sabotaged.
      */
     public void process(Lease lease) {
+        try {
+            processAndRecover(lease);
+        } catch (Error e) {
+            LOG.log(Level.ERROR, "Fatal error on item " + lease.item().id()
+                    + "; nothing was written, so the item returns after its lease expires", e);
+            throw e;
+        }
+    }
+
+    private void processAndRecover(Lease lease) {
         try {
             run(lease);
         } catch (InterruptedException e) {
@@ -129,7 +156,7 @@ public final class ItemProcessor {
     private void startAttempt(Lease lease) throws InterruptedException {
         WorkItem item = lease.item();
         if (retryPolicy.isExhausted(item.deliveryCount() - 1)) {
-            store.finish(lease, ItemStatus.FAILED, "delivery budget spent before an attempt was accepted");
+            finish(lease, ItemStatus.FAILED, "delivery budget spent before an attempt was accepted");
             return;
         }
         Optional<Boolean> offered = beforeSubmit(lease, "offer check",
@@ -138,7 +165,7 @@ public final class ItemProcessor {
             return;
         }
         if (!offered.get()) {
-            store.finish(lease, ItemStatus.SKIPPED_OFFER_CHANGED, "offer is no longer " + item.pin());
+            finish(lease, ItemStatus.SKIPPED_OFFER_CHANGED, "offer is no longer " + item.pin());
             return;
         }
         if (!beforeSubmit(lease, "lease renewal", () -> renewLease(lease)).orElse(false)) {
@@ -146,7 +173,8 @@ public final class ItemProcessor {
         }
         SubmitResult result;
         try {
-            result = gateway.submit(ApplyCommand.forItem(item));
+            result = Objects.requireNonNull(
+                    gateway.submit(ApplyCommand.forItem(item)), "gateway returned a null submit result");
         } catch (RuntimeException e) {
             if (Thread.interrupted()) {
                 LOG.log(Level.INFO, "Submit for item {0} was cut short by a shutdown; handing it back", item.id());
@@ -168,11 +196,16 @@ public final class ItemProcessor {
 
     /** A version that no longer applies is a skip, like a changed offer; any other refusal fails. */
     private void finishRejected(Lease lease, SubmitResult.Rejected rejected) {
-        switch (rejected.kind()) {
-            case VERSION_NOT_APPLICABLE -> store.finish(lease, ItemStatus.SKIPPED_OFFER_CHANGED,
-                    "downstream says " + lease.item().pin() + " no longer applies: " + rejected.reason());
-            case OTHER -> store.finish(lease, ItemStatus.FAILED, "rejected: " + rejected.reason());
-        }
+        ItemStatus status = switch (rejected.kind()) {
+            case VERSION_NOT_APPLICABLE -> ItemStatus.SKIPPED_OFFER_CHANGED;
+            case OTHER -> ItemStatus.FAILED;
+        };
+        String detail = switch (rejected.kind()) {
+            case VERSION_NOT_APPLICABLE ->
+                    "downstream says " + lease.item().pin() + " no longer applies: " + rejected.reason();
+            case OTHER -> "rejected: " + rejected.reason();
+        };
+        finish(lease, status, detail);
     }
 
     /**
@@ -216,6 +249,8 @@ public final class ItemProcessor {
             } else if (status.get() == AttemptStatus.NOT_FOUND && !submitted) {
                 startAttempt(lease);
                 return;
+            } else if (status.get() == AttemptStatus.NOT_FOUND && reads.withinNotFoundGrace()) {
+                continue; // the status endpoint may lag the submit this delivery just made
             } else if (settle(lease, status.get())) {
                 return;
             }
@@ -244,27 +279,33 @@ public final class ItemProcessor {
 
     /** @return whether the status was final for this delivery; {@code false} means keep waiting */
     private boolean settle(Lease lease, AttemptStatus status) {
-        switch (status) {
-            case IN_PROGRESS -> {
-                return false;
-            }
+        return switch (status) {
+            case IN_PROGRESS -> false;
             case SUCCEEDED -> {
                 if (finishDone(lease)) {
                     reportSuccess(lease);
                 }
+                yield true;
             }
-            case FAILED_RETRYABLE -> retryOrFail(lease, RequeueReason.ATTEMPT_FAILED, "downstream failure");
-            case FAILED_PERMANENT -> store.finish(lease, ItemStatus.FAILED, "downstream permanent failure");
-            case NOT_FOUND -> retryOrFail(lease, RequeueReason.OUTCOME_UNKNOWN, "submit was lost");
-        }
-        return true;
+            case FAILED_RETRYABLE -> {
+                retryOrFail(lease, RequeueReason.ATTEMPT_FAILED, "downstream failure");
+                yield true;
+            }
+            case FAILED_PERMANENT -> {
+                finish(lease, ItemStatus.FAILED, "downstream permanent failure");
+                yield true;
+            }
+            case NOT_FOUND -> {
+                retryOrFail(lease, RequeueReason.OUTCOME_UNKNOWN, "submit was lost");
+                yield true;
+            }
+        };
     }
 
-    /** @return whether DONE was recorded without the store throwing */
+    /** @return whether DONE was recorded: the store neither threw nor reported a lost lease */
     private boolean finishDone(Lease lease) {
         try {
-            store.finish(lease, ItemStatus.DONE, "applied");
-            return true;
+            return finish(lease, ItemStatus.DONE, "applied");
         } catch (RuntimeException e) {
             LOG.log(Level.WARNING, "Item " + lease.item().id() + " succeeded downstream but DONE could not be"
                     + " recorded; leaving it to lease expiry, when the next delivery will finish it", e);
@@ -323,7 +364,7 @@ public final class ItemProcessor {
         WorkItem item = lease.item();
         if (retryPolicy.isDeferralLimitReached(item.deferrals())) {
             if (mayFailAtLimit) {
-                store.finish(lease, ItemStatus.FAILED, "deferred " + item.deferrals()
+                finish(lease, ItemStatus.FAILED, "deferred " + item.deferrals()
                         + " times without being attempted; last cause: " + cause);
                 return;
             }
@@ -338,22 +379,22 @@ public final class ItemProcessor {
         }
         LOG.log(Level.INFO, "Deferring item {0} without an attempt, deferral {1} of {2}; cause: {3}",
                 item.id(), item.deferrals() + 1, retryPolicy.maxDeferrals(), cause);
-        store.requeue(lease, reason, clock.instant().plus(delay));
+        requeue(lease, reason, clock.instant().plus(delay));
     }
 
     private void retryOrFail(Lease lease, RequeueReason reason, String detail) {
         int deliveryCount = lease.item().deliveryCount();
         if (retryPolicy.isExhausted(deliveryCount)) {
-            store.finish(lease, ItemStatus.FAILED, detail + " after " + deliveryCount + " deliveries");
+            finish(lease, ItemStatus.FAILED, detail + " after " + deliveryCount + " deliveries");
             return;
         }
-        store.requeue(lease, reason, clock.instant().plus(retryPolicy.backoff(deliveryCount)));
+        requeue(lease, reason, clock.instant().plus(retryPolicy.backoff(deliveryCount)));
     }
 
     private void requeueWithBackoff(Lease lease, RequeueReason reason) {
         try {
             Instant notBefore = clock.instant().plus(retryPolicy.backoff(lease.item().deliveryCount()));
-            store.requeue(lease, reason, notBefore);
+            requeue(lease, reason, notBefore);
         } catch (RuntimeException e) {
             logLeftToLeaseExpiry(lease, e);
         }
@@ -366,7 +407,7 @@ public final class ItemProcessor {
      */
     private void handBack(Lease lease) {
         try {
-            store.requeue(lease, RequeueReason.HANDED_BACK, clock.instant());
+            requeue(lease, RequeueReason.HANDED_BACK, clock.instant());
         } catch (RuntimeException e) {
             logLeftToLeaseExpiry(lease, e);
         }
@@ -378,6 +419,55 @@ public final class ItemProcessor {
         } catch (RuntimeException e) {
             logLeftToLeaseExpiry(lease, e);
         }
+    }
+
+    /** Records a terminal status; a {@code false} means the lease was lost and nothing was written. */
+    private boolean finish(Lease lease, ItemStatus status, String detail) {
+        boolean written = store.finish(lease, status, boundedDetail(detail));
+        if (!written) {
+            warnLeaseLost(lease, "finish as " + status);
+        }
+        return written;
+    }
+
+    /** Sends the item back; a {@code false} means the lease was lost and nothing was written. */
+    private boolean requeue(Lease lease, RequeueReason reason, Instant notBefore) {
+        boolean written = store.requeue(lease, reason, notBefore);
+        if (!written) {
+            warnLeaseLost(lease, "requeue as " + reason);
+        }
+        return written;
+    }
+
+    private static void warnLeaseLost(Lease lease, String recording) {
+        LOG.log(Level.WARNING, "Lost the lease on item " + lease.item().id() + " while trying to " + recording
+                + "; nothing was written, leaving it to the new owner");
+    }
+
+    /**
+     * The detail as stored: control characters (newlines included) become spaces, and a text
+     * longer than {@value #MAX_DETAIL_LENGTH} characters is cut, ending in an ellipsis that
+     * counts toward the maximum. A surrogate pair is never split.
+     */
+    private static String boundedDetail(String detail) {
+        StringBuilder oneLine = new StringBuilder(Math.min(detail.length(), MAX_DETAIL_LENGTH + 1));
+        for (int i = 0; i < detail.length(); i++) {
+            oneLine.append(isControl(detail.charAt(i)) ? ' ' : detail.charAt(i));
+        }
+        if (oneLine.length() <= MAX_DETAIL_LENGTH) {
+            return oneLine.toString();
+        }
+        int keep = MAX_DETAIL_LENGTH - ELLIPSIS.length();
+        if (Character.isHighSurrogate(oneLine.charAt(keep - 1))) {
+            keep--;
+        }
+        return oneLine.substring(0, keep) + ELLIPSIS;
+    }
+
+    private static boolean isControl(char c) {
+        return Character.isISOControl(c)
+                || Character.getType(c) == Character.LINE_SEPARATOR
+                || Character.getType(c) == Character.PARAGRAPH_SEPARATOR;
     }
 
     private static long nanosSaturating(Duration duration) {
@@ -401,16 +491,19 @@ public final class ItemProcessor {
 
         private final Lease lease;
         private int consecutiveFailures;
+        private int consecutiveNotFound;
 
         private StatusReads(Lease lease) {
             this.lease = lease;
         }
 
-        /** @return the status, or empty if it could not be read */
+        /** @return the status, or empty if it could not be read; a null answer counts as unreadable */
         Optional<AttemptStatus> next() {
             try {
-                AttemptStatus status = gateway.status(lease.item().attemptId());
+                AttemptStatus status = Objects.requireNonNull(
+                        gateway.status(lease.item().attemptId()), "gateway returned a null status");
                 consecutiveFailures = 0;
+                consecutiveNotFound = status == AttemptStatus.NOT_FOUND ? consecutiveNotFound + 1 : 0;
                 return Optional.of(status);
             } catch (RuntimeException e) {
                 consecutiveFailures++;
@@ -418,6 +511,11 @@ public final class ItemProcessor {
                         + " (" + consecutiveFailures + " consecutive)", e);
                 return Optional.empty();
             }
+        }
+
+        /** Whether the NOT_FOUND just read is one of the first few in a row. An unreadable read leaves the run alone. */
+        boolean withinNotFoundGrace() {
+            return consecutiveNotFound <= NOT_FOUND_GRACE_READS;
         }
 
         boolean exhausted() {

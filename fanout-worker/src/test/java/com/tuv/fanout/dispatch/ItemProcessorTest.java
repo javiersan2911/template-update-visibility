@@ -9,6 +9,7 @@ import static com.tuv.fanout.support.FakeEngagementGateway.Behavior.REJECT_VERSI
 import static com.tuv.fanout.support.FakeEngagementGateway.Behavior.THROTTLE;
 import static com.tuv.fanout.support.FakeEngagementGateway.Behavior.THROW_ON_SUBMIT;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.tuv.fanout.capacity.CapacityFeedback;
 import com.tuv.fanout.domain.EngagementId;
@@ -29,19 +30,29 @@ import com.tuv.fanout.port.SubmitResult;
 import com.tuv.fanout.support.FakeEngagementGateway;
 import com.tuv.fanout.support.FakeEngagementGateway.Behavior;
 import com.tuv.fanout.support.InMemoryItemStore;
+import com.tuv.fanout.support.LogCapture;
 import com.tuv.fanout.support.MutableClock;
 import com.tuv.fanout.support.RecordingFeedback;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
+import java.util.logging.Level;
+import java.util.stream.Stream;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 
+@Timeout(60)
 class ItemProcessorTest {
 
     private static final FirmId FIRM = new FirmId("firm-a");
@@ -832,6 +843,351 @@ class ItemProcessorTest {
         assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
         assertThat(gateway.submittedAttemptIds(ENGAGEMENT)).hasSize(2).containsOnly(store.itemOf(ITEM).attemptId());
         assertThat(gateway.successfulApplies(ENGAGEMENT)).isEqualTo(1);
+    }
+
+    // ---- the result of every store write is checked ----
+
+    static Stream<Arguments> writesThatCanLoseTheLease() {
+        return Stream.of(
+                Arguments.of("permanent failure", FAIL_PERMANENT, "FAILED"),
+                Arguments.of("rejection", REJECT, "FAILED"),
+                Arguments.of("version no longer applies", REJECT_VERSION_NOT_APPLICABLE, "SKIPPED_OFFER_CHANGED"),
+                Arguments.of("retryable failure", FAIL_RETRYABLE, "ATTEMPT_FAILED"),
+                Arguments.of("throttled", THROTTLE, "CAPACITY_DEFERRED"),
+                Arguments.of("transport error", THROW_ON_SUBMIT, "OUTCOME_UNKNOWN"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("writesThatCanLoseTheLease")
+    void aWriteThatReportsALostLeaseIsLoggedWithTheItemAndWhatWasBeingRecorded(
+            String scenario, Behavior behavior, String recorded) {
+        gateway.script(ENGAGEMENT, behavior);
+        LeaseWriter leaseLost = new RefusingWrites(store);
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            deliver(processor(leaseLost, gateway, (engagementId, pin) -> true));
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::message)
+                    .anySatisfy(message -> assertThat(message).contains(ITEM.toString()).contains(recorded));
+        }
+    }
+
+    @Test
+    void aSuccessWhoseDoneWasNotWrittenBecauseTheLeaseWasLostIsNotReportedToTheLimiter() {
+        LeaseWriter leaseLost = new RefusingWrites(store);
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            deliver(processor(leaseLost, gateway, (engagementId, pin) -> true));
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::message)
+                    .anySatisfy(message -> assertThat(message).contains(ITEM.toString()).contains("DONE"));
+        }
+
+        assertThat(gateway.successfulApplies(ENGAGEMENT)).isEqualTo(1);
+        assertThat(feedback.successes()).as("nothing was recorded, so nothing is reported").isZero();
+        assertThat(store.statusOf(ITEM)).as("the store was not written").isEqualTo(ItemStatus.LEASED);
+    }
+
+    @Test
+    void aHandBackThatReportsALostLeaseIsLogged() {
+        gateway.script(ENGAGEMENT, HANG);
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            interruptedProcess(processor(new RefusingWrites(store), gateway, (engagementId, pin) -> true), leaseItem());
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::message)
+                    .anySatisfy(message -> assertThat(message).contains(ITEM.toString()).contains("HANDED_BACK"));
+        }
+    }
+
+    // ---- a null answer from the gateway is a failed call, said so clearly ----
+
+    @Test
+    void aNullSubmitResultIsTreatedLikeASubmitThatThrew() {
+        EngagementGateway nullSubmit = new ScriptedGateway(null, AttemptStatus.SUCCEEDED);
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            deliver(processor(store, nullSubmit, (engagementId, pin) -> true));
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::thrown)
+                    .anySatisfy(thrown -> assertThat(thrown).hasMessageContaining("null submit result"));
+        }
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM).deliveryCount()).as("a submit may have been accepted: no refund").isEqualTo(1);
+        assertThat(feedback.troubleFirms()).containsExactly(FIRM);
+    }
+
+    @Test
+    void aNullStatusIsTreatedLikeAStatusReadThatThrew() {
+        ScriptedGateway nullStatus = new ScriptedGateway(new SubmitResult.Accepted(), (AttemptStatus) null);
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            deliver(processor(store, nullStatus, (engagementId, pin) -> true));
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::thrown)
+                    .anySatisfy(thrown -> assertThat(thrown).hasMessageContaining("null status"));
+        }
+
+        assertThat(nullStatus.statusReads()).as("three unreadable reads in a row").isEqualTo(3);
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(feedback.troubleFirms()).containsExactly(FIRM);
+    }
+
+    // ---- a status endpoint that lags the submit ----
+
+    @Test
+    void aStatusEndpointThatLagsTheSubmitByTwoReadsStillEndsAsDoneWithOneSubmitAndNoDeliverySpent() {
+        ScriptedGateway lagging = new ScriptedGateway(new SubmitResult.Accepted(),
+                AttemptStatus.NOT_FOUND, AttemptStatus.NOT_FOUND, AttemptStatus.SUCCEEDED);
+
+        deliver(processor(store, lagging, (engagementId, pin) -> true));
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(lagging.submits()).isEqualTo(1);
+        assertThat(store.itemOf(ITEM).deliveryCount()).as("not requeued, so no delivery was spent").isEqualTo(1);
+        assertThat(feedback.successes()).isEqualTo(1);
+    }
+
+    @Test
+    void anAcceptedSubmitWhoseStatusStaysNotFoundIsRequeuedAsUnknownOnlyAfterTheGraceReads() {
+        ScriptedGateway lost = new ScriptedGateway(new SubmitResult.Accepted(), AttemptStatus.NOT_FOUND);
+
+        deliver(processor(store, lost, (engagementId, pin) -> true));
+
+        assertThat(lost.statusReads()).as("three tolerated reads, the fourth is the verdict").isEqualTo(4);
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.READY);
+        assertThat(store.itemOf(ITEM).attemptNumber()).as("same key: the outcome is unknown").isEqualTo(1);
+        assertThat(store.itemOf(ITEM).deliveryCount()).as("the delivery is spent").isEqualTo(1);
+    }
+
+    @Test
+    void aReadableStatusThatIsNotNotFoundStartsTheGraceOver() {
+        ScriptedGateway flapping = new ScriptedGateway(new SubmitResult.Accepted(),
+                AttemptStatus.NOT_FOUND, AttemptStatus.NOT_FOUND, AttemptStatus.NOT_FOUND,
+                AttemptStatus.IN_PROGRESS,
+                AttemptStatus.NOT_FOUND, AttemptStatus.NOT_FOUND, AttemptStatus.NOT_FOUND,
+                AttemptStatus.SUCCEEDED);
+
+        deliver(processor(store, flapping, (engagementId, pin) -> true));
+
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(flapping.statusReads()).isEqualTo(8);
+    }
+
+    @Test
+    void theGraceDoesNotApplyToARedeliveryWhoseRunningAttemptIsThenNotFound() {
+        ScriptedGateway vanished = new ScriptedGateway(new SubmitResult.Accepted(),
+                AttemptStatus.IN_PROGRESS, AttemptStatus.NOT_FOUND, AttemptStatus.SUCCEEDED);
+        store.enqueue(List.of(WorkItem.create(FIRM, ENGAGEMENT, PIN)));
+        store.leaseNext(FIRM, clock.instant(), Duration.ZERO).orElseThrow();
+
+        deliverAgain(processor(store, vanished, (engagementId, pin) -> true));
+
+        assertThat(vanished.submits()).as("this delivery submitted nothing, so NOT_FOUND means: submit now")
+                .isEqualTo(1);
+        assertThat(vanished.submittedKeys()).containsExactly(store.itemOf(ITEM).attemptId());
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(vanished.statusReads()).isEqualTo(3);
+    }
+
+    @Test
+    void anErrorWhileHandingTheItemBackIsStillLoggedWithTheItem() {
+        Fatal fatal = new Fatal();
+        LeaseWriter dyingRequeue = new LeaseWriter() {
+            @Override
+            public boolean renew(Lease lease, Instant newExpiry) {
+                return store.renew(lease, newExpiry);
+            }
+
+            @Override
+            public boolean finish(Lease lease, ItemStatus terminalStatus, String detail) {
+                return store.finish(lease, terminalStatus, detail);
+            }
+
+            @Override
+            public boolean requeue(Lease lease, RequeueReason reason, Instant notBefore) {
+                throw fatal;
+            }
+        };
+        gateway.script(ENGAGEMENT, HANG);
+        ItemProcessor processor = processor(dyingRequeue, gateway, (engagementId, pin) -> true);
+        Lease lease = leaseItem();
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            Thread.currentThread().interrupt();
+            try {
+                assertThatThrownBy(() -> processor.process(lease)).isSameAs(fatal);
+            } finally {
+                Thread.interrupted();
+            }
+
+            assertThat(log.at(Level.SEVERE)).singleElement().satisfies(entry -> {
+                assertThat(entry.message()).contains(ITEM.toString());
+                assertThat(entry.thrown()).isSameAs(fatal);
+            });
+        }
+    }
+
+    // ---- delivery budget, lower side ----
+
+    @Test
+    void afterTwoCrashesBeforeAnySubmitTheThirdDeliveryStillSubmitsAndReachesDone() {
+        store.enqueue(List.of(WorkItem.create(FIRM, ENGAGEMENT, PIN)));
+        for (int crash = 0; crash < MAX_DELIVERIES - 1; crash++) {
+            store.leaseNext(FIRM, clock.instant(), Duration.ZERO).orElseThrow();
+        }
+
+        deliverAgain(processor());
+
+        assertThat(store.itemOf(ITEM).deliveryCount()).isEqualTo(MAX_DELIVERIES);
+        assertThat(store.statusOf(ITEM)).isEqualTo(ItemStatus.DONE);
+        assertThat(gateway.submissionCount()).isEqualTo(1);
+    }
+
+    // ---- an Error is logged, then propagates ----
+
+    @Test
+    void anErrorInsideProcessingIsLoggedWithTheItemAndThenPropagates() {
+        Fatal fatal = new Fatal();
+        EngagementGateway dying = new EngagementGateway() {
+            @Override
+            public SubmitResult submit(ApplyCommand command) {
+                throw fatal;
+            }
+
+            @Override
+            public AttemptStatus status(AttemptId attemptId) {
+                return AttemptStatus.NOT_FOUND;
+            }
+        };
+        ItemProcessor processor = processor(store, dying, (engagementId, pin) -> true);
+        Lease lease = leaseItem();
+
+        try (LogCapture log = LogCapture.of(ItemProcessor.class)) {
+            assertThatThrownBy(() -> processor.process(lease)).isSameAs(fatal);
+
+            assertThat(log.at(Level.SEVERE)).singleElement().satisfies(entry -> {
+                assertThat(entry.message()).contains(ITEM.toString()).contains("lease expires");
+                assertThat(entry.thrown()).isSameAs(fatal);
+            });
+        }
+        assertThat(store.statusOf(ITEM)).as("left to lease expiry").isEqualTo(ItemStatus.LEASED);
+    }
+
+    // ---- stored details are bounded and single-line ----
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(SubmitResult.Rejected.Kind.class)
+    void aRejectionReasonIsStoredOnOneLineAndTruncatedToFiveHundredCharactersWithAnEllipsis(
+            SubmitResult.Rejected.Kind kind) {
+        String reason = "bad\nrequest\r\n\tdetail\u0000" + "x".repeat(5_000);
+        ScriptedGateway rejecting = new ScriptedGateway(new SubmitResult.Rejected(kind, reason));
+
+        deliver(processor(store, rejecting, (engagementId, pin) -> true));
+
+        String detail = store.detailOf(ITEM);
+        assertThat(detail).hasSize(500).endsWith("\u2026");
+        assertThat(detail.chars()).noneMatch(Character::isISOControl);
+        assertThat(detail).contains("bad request   detail ");
+    }
+
+    @Test
+    void aDetailOfExactlyFiveHundredCharactersIsStoredWhole() {
+        String prefix = "rejected: ";
+        ScriptedGateway rejecting = new ScriptedGateway(new SubmitResult.Rejected(
+                SubmitResult.Rejected.Kind.OTHER, "y".repeat(500 - prefix.length())));
+
+        deliver(processor(store, rejecting, (engagementId, pin) -> true));
+
+        assertThat(store.detailOf(ITEM)).hasSize(500).doesNotContain("\u2026").endsWith("yyy");
+    }
+
+    @Test
+    void truncationNeverSplitsASurrogatePair() {
+        ScriptedGateway rejecting = new ScriptedGateway(new SubmitResult.Rejected(
+                SubmitResult.Rejected.Kind.OTHER, "\uD83D\uDE00".repeat(1_000)));
+
+        deliver(processor(store, rejecting, (engagementId, pin) -> true));
+
+        String detail = store.detailOf(ITEM);
+        assertThat(detail).hasSizeLessThanOrEqualTo(500).endsWith("\u2026");
+        assertThat(new String(detail.getBytes(StandardCharsets.UTF_8), StandardCharsets.UTF_8))
+                .as("no lone surrogate").isEqualTo(detail);
+    }
+
+    private static final class Fatal extends Error {
+
+        private static final long serialVersionUID = 1L;
+
+        private Fatal() {
+            super("simulated VM error");
+        }
+    }
+
+    /** Submit answers with one fixed result; status walks through the script and then repeats its last entry. */
+    private static final class ScriptedGateway implements EngagementGateway {
+
+        private final SubmitResult submitResult;
+        private final List<AttemptStatus> statuses;
+        private final List<AttemptId> submittedKeys = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final AtomicInteger submits = new AtomicInteger();
+        private final AtomicInteger statusReads = new AtomicInteger();
+
+        private ScriptedGateway(SubmitResult submitResult, AttemptStatus... statuses) {
+            this.submitResult = submitResult;
+            this.statuses = statuses.length == 0 ? List.of(AttemptStatus.SUCCEEDED) : Arrays.asList(statuses);
+        }
+
+        @Override
+        public SubmitResult submit(ApplyCommand command) {
+            submits.incrementAndGet();
+            submittedKeys.add(command.attemptId());
+            return submitResult;
+        }
+
+        @Override
+        public AttemptStatus status(AttemptId attemptId) {
+            int read = statusReads.getAndIncrement();
+            return statuses.get(Math.min(read, statuses.size() - 1));
+        }
+
+        int submits() {
+            return submits.get();
+        }
+
+        List<AttemptId> submittedKeys() {
+            return List.copyOf(submittedKeys);
+        }
+
+        int statusReads() {
+            return statusReads.get();
+        }
+    }
+
+    /** A store that has lost the lease: renewals work, but every finish and requeue reports {@code false}. */
+    private static final class RefusingWrites implements LeaseWriter {
+
+        private final LeaseWriter delegate;
+
+        private RefusingWrites(LeaseWriter delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public boolean renew(Lease lease, Instant newExpiry) {
+            return delegate.renew(lease, newExpiry);
+        }
+
+        @Override
+        public boolean finish(Lease lease, ItemStatus terminalStatus, String detail) {
+            return false;
+        }
+
+        @Override
+        public boolean requeue(Lease lease, RequeueReason reason, Instant notBefore) {
+            return false;
+        }
     }
 
     /** Fails the first {@code failures} renewals, as a store blip would, then behaves. */

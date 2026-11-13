@@ -48,6 +48,10 @@ public record WorkItem(
         return new AttemptId(id + "#" + attemptNumber);
     }
 
+    private static boolean refundsADelivery(RequeueReason reason) {
+        return reason == RequeueReason.CAPACITY_DEFERRED || reason == RequeueReason.NOT_ATTEMPTED;
+    }
+
     public WorkItem delivered() {
         return new WorkItem(id, firmId, engagementId, pin, attemptNumber, deliveryCount + 1, deferrals);
     }
@@ -55,8 +59,14 @@ public record WorkItem(
     /**
      * The item after going back to the queue. The refunded reasons count as deferrals; a
      * reason that follows a real attempt resets the count; a hand-back leaves it alone.
+     *
+     * @throws IllegalStateException if a refunding reason is given for an item that was never
+     *         leased, since there is no delivery to refund
      */
     public WorkItem requeued(RequeueReason reason) {
+        if (deliveryCount == 0 && refundsADelivery(reason)) {
+            throw new IllegalStateException("an item that was never leased cannot be requeued with " + reason);
+        }
         return switch (reason) {
             case CAPACITY_DEFERRED, NOT_ATTEMPTED ->
                     new WorkItem(id, firmId, engagementId, pin, attemptNumber, deliveryCount - 1, deferrals + 1);

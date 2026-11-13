@@ -62,4 +62,17 @@ class AimdConfigTest {
         assertThatIllegalArgumentException().isThrownBy(() -> new AimdConfig(
                 10, 100, 10, 50, 5, Duration.ofMinutes(5), factor, Duration.ofMinutes(1), Duration.ofMinutes(1)));
     }
+
+    @Test
+    void theDefaultsAreTheArchitecturesNumbers() {
+        AimdConfig defaults = AimdConfig.defaults();
+
+        assertThat(defaults.floor()).as("global limit lower bound").isEqualTo(10);
+        assertThat(defaults.ceiling()).as("global limit upper bound").isEqualTo(100);
+        assertThat(defaults.initialLimit()).as("starts at the floor").isEqualTo(10);
+        assertThat(defaults.perFirmCap()).isEqualTo(50);
+        assertThat(defaults.increaseStep()).isEqualTo(5);
+        assertThat(defaults.increaseInterval()).isEqualTo(Duration.ofMinutes(5));
+        assertThat(defaults.decreaseFactor()).isEqualTo(0.5);
+    }
 }
