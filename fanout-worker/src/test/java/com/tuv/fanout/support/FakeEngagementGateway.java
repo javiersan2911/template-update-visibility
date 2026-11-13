@@ -24,7 +24,7 @@ import java.util.Map;
 public final class FakeEngagementGateway implements EngagementGateway {
 
     public enum Behavior {
-        SUCCEED, FAIL_RETRYABLE, FAIL_PERMANENT, THROTTLE, REJECT, HANG, THROW_ON_SUBMIT, LOSE_SUBMIT
+        SUCCEED, FAIL_RETRYABLE, FAIL_PERMANENT, THROTTLE, REJECT, REJECT_VERSION_NOT_APPLICABLE, HANG, THROW_ON_SUBMIT, LOSE_SUBMIT
     }
 
     private final Duration latency;
@@ -36,6 +36,7 @@ public final class FakeEngagementGateway implements EngagementGateway {
     private boolean statusDown;
     private int statusFailuresPending;
     private int statusCalls;
+    private Duration throttleRetryAfter = Duration.ofMillis(1);
 
     public FakeEngagementGateway(Duration latency) {
         this.latency = latency;
@@ -44,6 +45,11 @@ public final class FakeEngagementGateway implements EngagementGateway {
     /** Behaviours for successive new attempts on the engagement; afterwards it succeeds. */
     public synchronized void script(EngagementId engagementId, Behavior... behaviors) {
         scripts.put(engagementId, new ArrayDeque<>(List.of(behaviors)));
+    }
+
+    /** The Retry-After carried by every {@code THROTTLE} answer from now on. */
+    public synchronized void throttleRetryAfter(Duration retryAfter) {
+        this.throttleRetryAfter = retryAfter;
     }
 
     @Override
@@ -55,9 +61,12 @@ public final class FakeEngagementGateway implements EngagementGateway {
         Behavior behavior = nextBehavior(command.engagementId());
         switch (behavior) {
             case THROTTLE:
-                return new SubmitResult.Throttled(Duration.ofMillis(1));
+                return new SubmitResult.Throttled(throttleRetryAfter);
             case REJECT:
-                return new SubmitResult.Rejected("version mismatch");
+                return new SubmitResult.Rejected(SubmitResult.Rejected.Kind.OTHER, "malformed command");
+            case REJECT_VERSION_NOT_APPLICABLE:
+                return new SubmitResult.Rejected(
+                        SubmitResult.Rejected.Kind.VERSION_NOT_APPLICABLE, "version 7 is withdrawn");
             case THROW_ON_SUBMIT:
                 throw new IllegalStateException("connection reset");
             case LOSE_SUBMIT:

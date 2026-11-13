@@ -35,6 +35,12 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>The dispatcher keeps no state of its own that matters. Killing it at any point loses
  * nothing: leases expire and another instance continues with the same idempotency keys.
+ *
+ * <p><strong>Capacity bounds need a single active dispatcher.</strong> The limiter is in
+ * memory, so its global limit and per-firm caps hold per process. The architecture runs the
+ * dispatcher behind leader election for that reason. Several workers on one store are safe
+ * for exactly-once processing, because leases live in the store, but each has its own
+ * limiter and so the limits multiply by the number of workers.
  */
 public final class FanOutDispatcher implements AutoCloseable {
 
@@ -42,6 +48,9 @@ public final class FanOutDispatcher implements AutoCloseable {
 
     /** Longest a firm whose lease calls keep failing is left alone. */
     private static final Duration MAX_COOL_OFF = Duration.ofMinutes(1);
+
+    /** How long {@code close()} waits, after interrupting workers, for their hand-backs. */
+    private static final Duration HAND_BACK_WAIT = Duration.ofSeconds(10);
 
     private final ItemLeasing store;
     private final FairScheduler scheduler;
@@ -84,7 +93,9 @@ public final class FanOutDispatcher implements AutoCloseable {
     /**
      * Stops admitting work, then waits up to the shutdown grace for in-flight items. Items
      * still running after that are interrupted; each hands itself back to the queue so
-     * another worker can resume it at once under the same idempotency key.
+     * another worker can resume it at once under the same idempotency key. {@code close()}
+     * then waits a further fixed 10 seconds for those hand-backs to complete, and logs a
+     * warning if some did not; their items are then left to lease expiry.
      */
     @Override
     public synchronized void close() {
@@ -98,10 +109,18 @@ public final class FanOutDispatcher implements AutoCloseable {
             workers.shutdown();
             if (!workers.awaitTermination(config.shutdownGrace().toMillis(), TimeUnit.MILLISECONDS)) {
                 workers.shutdownNow();
+                awaitHandBacks();
             }
         } catch (InterruptedException e) {
             workers.shutdownNow();
             Thread.currentThread().interrupt();
+        }
+    }
+
+    private void awaitHandBacks() throws InterruptedException {
+        if (!workers.awaitTermination(HAND_BACK_WAIT.toMillis(), TimeUnit.MILLISECONDS)) {
+            LOG.log(Level.WARNING, "Interrupted workers did not finish handing back their items within "
+                    + HAND_BACK_WAIT + "; those items are left to lease expiry");
         }
     }
 

@@ -91,6 +91,11 @@ public final class InMemoryItemStore implements ItemStore {
         return entries.get(id).item;
     }
 
+    /** The instant before which the item is not dispatchable. */
+    public synchronized Instant notBeforeOf(ItemId id) {
+        return entries.get(id).notBefore;
+    }
+
     public synchronized String detailOf(ItemId id) {
         return entries.get(id).detail;
     }
