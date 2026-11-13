@@ -111,6 +111,13 @@ public final class InMemoryItemStore implements InspectableItemStore {
                 .count();
     }
 
+    /** Items of the firm currently leased, whether or not the lease has expired. */
+    public synchronized long countLeased(FirmId firmId) {
+        return entries.values().stream()
+                .filter(entry -> entry.item.firmId().equals(firmId) && entry.status == ItemStatus.LEASED)
+                .count();
+    }
+
     /** One atomic read, so an item moving between READY and LEASED is never missed. */
     public synchronized long countUnfinished() {
         return entries.values().stream().filter(entry -> !entry.status.isTerminal()).count();

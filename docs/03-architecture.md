@@ -1716,6 +1716,16 @@ All dashboards show aggregates only, with no identifiers (§8.3).
 - Negative: write-back latency is unbounded.
 - Alternatives: push a "pending declines" record into an ES side table (preferred if ES agrees, because it removes the sole-record condition; raised as open risk OR-2); forced loads (rejected on cost).
 
+**ADR-009 SQS standard for event transport; Postgres table for the work queue; no Kafka.**
+- Context: C-8, §10, §11, NFR-9, NFR-19. Two different needs: carrying events between systems, and queueing load-requiring work items.
+- Decision: events travel over EventBridge and SQS standard queues with DLQs (§10). Dispatcher work items live in `load_job_item` and are leased with `FOR UPDATE SKIP LOCKED` (§7.2, §11). In the MVP worker this is the `ItemStore` port. Kafka is not used.
+- Positive (transport): ordering, duplicates and loss are handled by the inbox, sequence-conditional writes and reconciliation polls, so the transport needs no guarantees; no cluster to run per residency zone; cross-region delivery of branch snapshots is an EventBridge rule.
+- Positive (work queue): per-firm fair ordering, per-firm caps, priority lanes, the pin re-check at dispatch and job progress are all queries on one table; the decision, the item and the outbox row commit in one transaction; lease expiry gives crash recovery with the same idempotency key.
+- Negative: no replay of past events, so a projection is rebuilt from the catalog and acquisition, not from a log; the dispatcher and the outbox relay poll; lease and retry logic is our code to maintain.
+- Alternatives: Kafka for event transport (per-key ordering, replay and cheap extra consumers, but a cluster per zone plus cross-region replication, and the sequence and reconciliation logic is still needed for loss at the source); SQS or Kafka as the work queue (rejected: items take ~1 min and run at most ~100 in parallel, so admission control is the constraint, not throughput; a broker gives no fair ordering across firms, no per-firm caps and no queryable state, and a Kafka partition blocks a firm behind one slow item); SQS FIFO (not needed, §10).
+- Revisit if: ES already publishes its events to Kafka, or replay is needed to rebuild projections.
+- Status: Proposed.
+
 ### 20.3 Evolution path
 
 | Trigger | Change |

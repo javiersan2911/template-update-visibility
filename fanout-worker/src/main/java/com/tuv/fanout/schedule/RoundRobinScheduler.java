@@ -7,9 +7,14 @@ import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * Round robin across firms: each firm with work gets one item per cycle, so a firm with
- * 40,000 items cannot starve a firm with 40. This is deficit round robin with a quantum of
- * one item, which is all that is needed while every item has the same cost.
+ * Round robin across firms: decides who is offered the next free slot, giving each firm
+ * with work one offer per cycle, so a firm with 40,000 items does not queue a firm with 40
+ * behind it. This is deficit round robin with a quantum of one item, which is all that is
+ * needed while every item has the same cost.
+ *
+ * <p>It only orders offers. It cannot stop a firm from holding slots: if a firm's items run
+ * for ever, each slot it takes is never freed and it ratchets up to the whole pool. Bounding
+ * what one firm may hold is the capacity limiter's job (its fair share of the global limit).
  *
  * <p>Not thread-safe; it is confined to the dispatcher thread.
  */

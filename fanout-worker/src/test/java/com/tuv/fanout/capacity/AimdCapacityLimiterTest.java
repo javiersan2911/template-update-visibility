@@ -1,11 +1,16 @@
 package com.tuv.fanout.capacity;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 
 import com.tuv.fanout.domain.FirmId;
 import com.tuv.fanout.support.MutableClock;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class AimdCapacityLimiterTest {
 
@@ -24,36 +29,36 @@ class AimdCapacityLimiterTest {
 
     @Test
     void refusesAdmissionBeyondTheGlobalLimit() {
-        AimdCapacityLimiter limiter = limiter(2, 2, 2, 10);
+        AimdCapacityLimiter limiter = limiter(2, 2, 2, 2);
 
-        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
-        assertThat(limiter.tryAcquire(FIRM_B)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_B, 1)).isPresent();
 
         assertThat(limiter.hasCapacity()).isFalse();
-        assertThat(limiter.tryAcquire(FIRM_A)).isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isEmpty();
     }
 
     @Test
     void capsOneFirmWithoutBlockingOthers() {
         AimdCapacityLimiter limiter = limiter(10, 10, 10, 1);
 
-        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isPresent();
 
-        assertThat(limiter.tryAcquire(FIRM_A)).isEmpty();
-        assertThat(limiter.tryAcquire(FIRM_B)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_B, 1)).isPresent();
     }
 
     @Test
     void releasingAPermitFreesExactlyOneSlotEvenWhenClosedTwice() {
         AimdCapacityLimiter limiter = limiter(2, 2, 2, 2);
-        Permit first = limiter.tryAcquire(FIRM_A).orElseThrow();
-        limiter.tryAcquire(FIRM_A).orElseThrow();
+        Permit first = limiter.tryAcquire(FIRM_A, 1).orElseThrow();
+        limiter.tryAcquire(FIRM_A, 1).orElseThrow();
 
         first.close();
         first.close();
 
-        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
-        assertThat(limiter.tryAcquire(FIRM_A)).isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isEmpty();
     }
 
     @Test
@@ -83,7 +88,7 @@ class AimdCapacityLimiterTest {
 
     @Test
     void growsByOneStepPerHealthyIntervalUpToTheCeiling() {
-        AimdCapacityLimiter limiter = limiter(10, 18, 10, 50);
+        AimdCapacityLimiter limiter = limiter(10, 18, 10, 18);
 
         limiter.recordSuccess(FIRM_A);
         assertThat(limiter.currentLimit()).as("too early to grow").isEqualTo(10);
@@ -117,9 +122,9 @@ class AimdCapacityLimiterTest {
         limiter.recordOverload(Duration.ofSeconds(30));
 
         assertThat(limiter.hasCapacity()).isFalse();
-        assertThat(limiter.tryAcquire(FIRM_A)).isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isEmpty();
         clock.advance(Duration.ofSeconds(30));
-        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isPresent();
     }
 
     @Test
@@ -136,16 +141,16 @@ class AimdCapacityLimiterTest {
     @Test
     void loweringTheLimitKeepsExistingPermitsAndBlocksNewOnes() {
         AimdCapacityLimiter limiter = limiter(1, 4, 4, 4);
-        Permit held = limiter.tryAcquire(FIRM_A).orElseThrow();
-        limiter.tryAcquire(FIRM_A).orElseThrow();
-        limiter.tryAcquire(FIRM_A).orElseThrow();
+        Permit held = limiter.tryAcquire(FIRM_A, 1).orElseThrow();
+        limiter.tryAcquire(FIRM_A, 1).orElseThrow();
+        limiter.tryAcquire(FIRM_A, 1).orElseThrow();
 
         limiter.recordOverload(Duration.ZERO);
 
         assertThat(limiter.currentLimit()).isEqualTo(2);
-        assertThat(limiter.tryAcquire(FIRM_B)).isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_B, 1)).isEmpty();
         held.close();
-        assertThat(limiter.tryAcquire(FIRM_B)).as("still 2 in flight against a limit of 2").isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_B, 1)).as("still 2 in flight against a limit of 2").isEmpty();
     }
 
     private AimdCapacityLimiter limiterWithMaxPause(Duration maxPause) {
@@ -163,7 +168,7 @@ class AimdCapacityLimiterTest {
         assertThat(limiter.hasCapacity()).isFalse();
         clock.advance(Duration.ofSeconds(1));
         assertThat(limiter.hasCapacity()).isTrue();
-        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isPresent();
     }
 
     @Test
@@ -243,8 +248,8 @@ class AimdCapacityLimiterTest {
         }
 
         assertThat(limiter.currentFirmCap(FIRM_A)).isEqualTo(1);
-        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
-        assertThat(limiter.tryAcquire(FIRM_A)).isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isEmpty();
     }
 
     @Test
@@ -260,17 +265,17 @@ class AimdCapacityLimiterTest {
     @Test
     void admissionsForAPenalisedFirmUseItsLoweredCapWhileOthersKeepTheirs() {
         AimdCapacityLimiter limiter = firmLimiter(40, 4);
-        Permit held = limiter.tryAcquire(FIRM_A).orElseThrow();
-        limiter.tryAcquire(FIRM_A).orElseThrow();
-        limiter.tryAcquire(FIRM_A).orElseThrow();
+        Permit held = limiter.tryAcquire(FIRM_A, 1).orElseThrow();
+        limiter.tryAcquire(FIRM_A, 1).orElseThrow();
+        limiter.tryAcquire(FIRM_A, 1).orElseThrow();
 
         limiter.recordFirmTrouble(FIRM_A);
 
         assertThat(limiter.currentFirmCap(FIRM_A)).isEqualTo(2);
-        assertThat(limiter.tryAcquire(FIRM_A)).as("3 in flight against a cap of 2").isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).as("3 in flight against a cap of 2").isEmpty();
         held.close();
-        assertThat(limiter.tryAcquire(FIRM_A)).as("2 in flight against a cap of 2").isEmpty();
-        assertThat(limiter.tryAcquire(FIRM_B)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).as("2 in flight against a cap of 2").isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_B, 1)).isPresent();
     }
 
     @Test
@@ -331,7 +336,7 @@ class AimdCapacityLimiterTest {
 
         assertThat(limiter.currentFirmCap(FIRM_A)).isEqualTo(20);
         assertThat(limiter.penalisedFirmCount()).isZero();
-        Permit one = limiter.tryAcquire(FIRM_A).orElseThrow();
+        Permit one = limiter.tryAcquire(FIRM_A, 1).orElseThrow();
         assertThat(one).isNotNull();
     }
 
@@ -339,13 +344,13 @@ class AimdCapacityLimiterTest {
     void aPenalisedFirmCapRisesForAdmissionsWithoutAnyOfItsOwnSuccesses() {
         AimdCapacityLimiter limiter = limiter(10, 40, 40, 4);
         limiter.recordFirmTrouble(FIRM_A);
-        limiter.tryAcquire(FIRM_A).orElseThrow();
-        limiter.tryAcquire(FIRM_A).orElseThrow();
-        assertThat(limiter.tryAcquire(FIRM_A)).isEmpty();
+        limiter.tryAcquire(FIRM_A, 1).orElseThrow();
+        limiter.tryAcquire(FIRM_A, 1).orElseThrow();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isEmpty();
 
         clock.advance(INCREASE_INTERVAL);
 
-        assertThat(limiter.tryAcquire(FIRM_A)).as("cap 2 + step 5, limited to the full cap of 4").isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).as("cap 2 + step 5, limited to the full cap of 4").isPresent();
     }
 
     @Test
@@ -425,6 +430,124 @@ class AimdCapacityLimiterTest {
         assertThat(limiter.currentFirmCap(FIRM_A)).isEqualTo(20);
     }
 
+    // --- fair share of the global limit
+
+    @Test
+    void withTwoContendingFirmsAFirmCannotHoldMoreThanHalfTheLimit() {
+        AimdCapacityLimiter limiter = limiter(10, 10, 10, 10);
+
+        for (int held = 0; held < 5; held++) {
+            assertThat(limiter.tryAcquire(FIRM_A, 2)).as("permit %d", held + 1).isPresent();
+        }
+
+        assertThat(limiter.tryAcquire(FIRM_A, 2)).as("a sixth would be above its share of 5").isEmpty();
+        assertThat(limiter.hasCapacity()).isTrue();
+        for (int held = 0; held < 5; held++) {
+            assertThat(limiter.tryAcquire(FIRM_B, 2)).as("the other firm's permit %d", held + 1).isPresent();
+        }
+        assertThat(limiter.hasCapacity()).isFalse();
+    }
+
+    @Test
+    void aFirmAloneGetsTheWholeLimit() {
+        AimdCapacityLimiter limiter = limiter(10, 10, 10, 10);
+
+        for (int held = 0; held < 10; held++) {
+            assertThat(limiter.tryAcquire(FIRM_A, 1)).as("permit %d", held + 1).isPresent();
+        }
+
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isEmpty();
+    }
+
+    @Test
+    void theShareRoundsUpSoTheSharesTogetherCoverTheLimit() {
+        AimdCapacityLimiter limiter = limiter(10, 10, 10, 10);
+
+        for (int held = 0; held < 4; held++) {
+            assertThat(limiter.tryAcquire(FIRM_A, 3)).as("ceil(10 / 3) = 4, permit %d", held + 1).isPresent();
+        }
+
+        assertThat(limiter.tryAcquire(FIRM_A, 3)).isEmpty();
+    }
+
+    @Test
+    void theShareIsNeverBelowOneEvenWithMoreFirmsThanSlots() {
+        AimdCapacityLimiter limiter = limiter(2, 2, 2, 2);
+
+        assertThat(limiter.tryAcquire(FIRM_A, 1_000)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1_000)).isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_B, 1_000)).isPresent();
+    }
+
+    @Test
+    void theAdaptiveFirmCapStillAppliesWhenItIsBelowTheShare() {
+        AimdCapacityLimiter limiter = limiter(10, 10, 10, 8);
+        limiter.recordFirmTrouble(FIRM_A);
+        assertThat(limiter.currentFirmCap(FIRM_A)).isEqualTo(4);
+
+        for (int held = 0; held < 4; held++) {
+            assertThat(limiter.tryAcquire(FIRM_A, 1)).isPresent();
+        }
+
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).as("share is 10 but the penalised cap is 4").isEmpty();
+    }
+
+    @Test
+    void aFirmAboveItsShareAfterASecondFirmAppearsGetsNothingNewWhileTheSecondFirmIsAdmitted() {
+        AimdCapacityLimiter limiter = limiter(10, 10, 10, 10);
+        List<Permit> held = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            held.add(limiter.tryAcquire(FIRM_A, 1).orElseThrow());
+        }
+
+        assertThat(limiter.tryAcquire(FIRM_A, 2)).as("8 held, share is now 5").isEmpty();
+        assertThat(limiter.tryAcquire(FIRM_B, 2)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_B, 2)).isPresent();
+        assertThat(limiter.hasCapacity()).as("the limit of 10 is reached").isFalse();
+
+        held.forEach(Permit::close);
+        assertThat(limiter.tryAcquire(FIRM_A, 2)).as("permits already held were never revoked, only drained")
+                .isPresent();
+    }
+
+    @Test
+    void aFirmBackUnderItsShareIsAdmittedAgain() {
+        AimdCapacityLimiter limiter = limiter(10, 10, 10, 10);
+        List<Permit> held = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            held.add(limiter.tryAcquire(FIRM_A, 1).orElseThrow());
+        }
+        assertThat(limiter.tryAcquire(FIRM_A, 2)).isEmpty();
+
+        held.get(0).close();
+        held.get(1).close();
+
+        assertThat(limiter.tryAcquire(FIRM_A, 2)).as("4 held, share is 5").isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 2)).as("5 held").isEmpty();
+    }
+
+    @Test
+    void theShareFollowsTheCurrentLimitAfterAnOverload() {
+        AimdCapacityLimiter limiter = limiter(2, 100, 40, 40);
+        limiter.recordOverload(Duration.ZERO);
+        assertThat(limiter.currentLimit()).isEqualTo(20);
+
+        for (int held = 0; held < 10; held++) {
+            assertThat(limiter.tryAcquire(FIRM_A, 2)).isPresent();
+        }
+
+        assertThat(limiter.tryAcquire(FIRM_A, 2)).as("half of 20").isEmpty();
+    }
+
+    @ParameterizedTest(name = "{0} contending firms")
+    @ValueSource(ints = {0, -1, Integer.MIN_VALUE})
+    void fewerThanOneContendingFirmIsRejected(int contendingFirms) {
+        AimdCapacityLimiter limiter = limiter(10, 10, 10, 10);
+
+        assertThatIllegalArgumentException().isThrownBy(() -> limiter.tryAcquire(FIRM_A, contendingFirms));
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).as("nothing was taken").isPresent();
+    }
+
     // --- fixed configuration
 
     @Test
@@ -477,13 +600,13 @@ class AimdCapacityLimiterTest {
 
         assertThat(limiter.currentLimit()).isEqualTo(Integer.MAX_VALUE);
         assertThat(limiter.hasCapacity()).isTrue();
-        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isPresent();
     }
 
     @Test
     void aFirmCapAndStepNearIntegerMaxValueRecoverToTheFullCapWithoutOverflowing() {
         AimdCapacityLimiter limiter = new AimdCapacityLimiter(
-                new AimdConfig(1, 100, 10, Integer.MAX_VALUE, Integer.MAX_VALUE, INCREASE_INTERVAL, 0.5,
+                new AimdConfig(1, Integer.MAX_VALUE, 10, Integer.MAX_VALUE, Integer.MAX_VALUE, INCREASE_INTERVAL, 0.5,
                         DECREASE_COOLDOWN),
                 clock);
         limiter.recordFirmTrouble(FIRM_A);
@@ -492,6 +615,6 @@ class AimdCapacityLimiterTest {
         clock.advance(INCREASE_INTERVAL);
 
         assertThat(limiter.currentFirmCap(FIRM_A)).isEqualTo(Integer.MAX_VALUE);
-        assertThat(limiter.tryAcquire(FIRM_A)).isPresent();
+        assertThat(limiter.tryAcquire(FIRM_A, 1)).isPresent();
     }
 }

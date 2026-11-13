@@ -15,6 +15,7 @@ import com.tuv.fanout.domain.Lease;
 import com.tuv.fanout.domain.RequeueReason;
 import com.tuv.fanout.domain.VersionPin;
 import com.tuv.fanout.port.ApplyCommand;
+import com.tuv.fanout.port.EngagementGateway;
 import com.tuv.fanout.port.FanOutSource.Target;
 import com.tuv.fanout.port.ItemLeasing;
 import com.tuv.fanout.port.LeaseWriter;
@@ -22,6 +23,8 @@ import com.tuv.fanout.schedule.FairScheduler;
 import com.tuv.fanout.schedule.RoundRobinScheduler;
 import com.tuv.fanout.support.FakeEngagementGateway;
 import com.tuv.fanout.support.FakeEngagementGateway.Behavior;
+import com.tuv.fanout.support.HangingGateway;
+import com.tuv.fanout.support.HangingGateway.Hang;
 import com.tuv.fanout.support.InMemoryItemStore;
 import com.tuv.fanout.support.LogCapture;
 import com.tuv.fanout.support.MutableClock;
@@ -53,30 +56,41 @@ class FanOutDispatcherTest {
     private static final VersionPin PIN = new VersionPin("audit", 7);
     private static final FirmId BIG_FIRM = new FirmId("big");
     private static final Duration TIMEOUT = Duration.ofSeconds(20);
+    private static final Duration POLL_INTERVAL = Duration.ofMillis(2);
 
     private final Clock clock = Clock.systemUTC();
     private final InMemoryItemStore store = new InMemoryItemStore();
     private final List<Target> targets = new ArrayList<>();
 
     private static DispatcherConfig config(Duration leaseDuration, Duration shutdownGrace) {
-        return new DispatcherConfig(
-                leaseDuration, Duration.ofMillis(2), Duration.ofSeconds(5), Duration.ofMillis(5), shutdownGrace);
+        return config(leaseDuration, shutdownGrace, callTimeoutFor(leaseDuration));
+    }
+
+    /** Generous next to an in-memory call, and the longest the renewal-cycle rule allows for a short lease. */
+    private static Duration callTimeoutFor(Duration leaseDuration) {
+        Duration longestAllowed = leaseDuration.minus(POLL_INTERVAL).dividedBy(2);
+        return longestAllowed.compareTo(Duration.ofSeconds(10)) < 0 ? longestAllowed : Duration.ofSeconds(10);
+    }
+
+    private static DispatcherConfig config(Duration leaseDuration, Duration shutdownGrace, Duration callTimeout) {
+        return new DispatcherConfig(leaseDuration, POLL_INTERVAL, Duration.ofSeconds(5),
+                Duration.ofMillis(5), shutdownGrace, callTimeout);
     }
 
     private FanOutDispatcher dispatcher(
-            FakeEngagementGateway gateway, AimdCapacityLimiter limiter, DispatcherConfig config) {
+            EngagementGateway gateway, AimdCapacityLimiter limiter, DispatcherConfig config) {
         return dispatcher(store, gateway, limiter, config);
     }
 
     private FanOutDispatcher dispatcher(
-            ItemLeasing leasing, FakeEngagementGateway gateway, AimdCapacityLimiter limiter, DispatcherConfig config) {
+            ItemLeasing leasing, EngagementGateway gateway, AimdCapacityLimiter limiter, DispatcherConfig config) {
         return dispatcher(leasing, store, gateway, limiter, config);
     }
 
     private FanOutDispatcher dispatcher(
             ItemLeasing leasing,
             LeaseWriter writer,
-            FakeEngagementGateway gateway,
+            EngagementGateway gateway,
             AimdCapacityLimiter limiter,
             DispatcherConfig config) {
         return dispatcher(leasing, writer, new RoundRobinScheduler(), clock, gateway, limiter, config);
@@ -87,7 +101,7 @@ class FanOutDispatcherTest {
             LeaseWriter writer,
             FairScheduler scheduler,
             Clock dispatcherClock,
-            FakeEngagementGateway gateway,
+            EngagementGateway gateway,
             AimdCapacityLimiter limiter,
             DispatcherConfig config) {
         RetryPolicy retryPolicy = new RetryPolicy(3, Duration.ofMillis(1), Duration.ofMillis(5), new Random(1));
@@ -327,7 +341,7 @@ class FanOutDispatcherTest {
 
         assertThat(store.count(ItemStatus.DONE)).isEqualTo(15);
         assertThat(store.countUnfinished(broken)).isEqualTo(3);
-        assertThat(IntStream.range(0, 4).mapToObj(i -> limiter.tryAcquire(BIG_FIRM)))
+        assertThat(IntStream.range(0, 4).mapToObj(i -> limiter.tryAcquire(BIG_FIRM, 1)))
                 .as("every permit was released").allSatisfy(permit -> assertThat(permit).isPresent());
     }
 
@@ -543,7 +557,7 @@ class FanOutDispatcherTest {
     }
 
     private static void assertTheFullLimitIsAvailable(AimdCapacityLimiter limiter) {
-        assertThat(IntStream.range(0, 2).mapToObj(i -> limiter.tryAcquire(BIG_FIRM)).toList())
+        assertThat(IntStream.range(0, 2).mapToObj(i -> limiter.tryAcquire(BIG_FIRM, 1)).toList())
                 .as("both permits can still be handed out").allSatisfy(permit -> assertThat(permit).isPresent());
     }
 
@@ -574,7 +588,7 @@ class FanOutDispatcherTest {
                     .noneSatisfy(message -> assertThat(message).contains("Dispatch pass failed"));
         }
         assertThat(store.statusOf(stranded)).as("only the lease expiry brings it back").isEqualTo(ItemStatus.LEASED);
-        assertThat(IntStream.range(0, 2).mapToObj(i -> limiter.tryAcquire(BIG_FIRM)))
+        assertThat(IntStream.range(0, 2).mapToObj(i -> limiter.tryAcquire(BIG_FIRM, 1)))
                 .as("the permit was released").allSatisfy(permit -> assertThat(permit).isPresent());
     }
 
@@ -634,6 +648,197 @@ class FanOutDispatcherTest {
 
         assertThat(leasing.leaseCalls()).as("the second firm was never offered a slot").containsExactly(
                 new FirmId("a-first"));
+    }
+
+    // ---- one firm's hung items cannot take the whole pool ----
+
+    @Test
+    void aFirmWhoseItemsNeverFinishCannotCrowdAWellBehavedFirmOutOfTheSlots() {
+        FirmId hanging = new FirmId("a-hanging");
+        FirmId healthy = new FirmId("b-ok");
+        publish(hanging, 40);
+        publish(healthy, 30);
+        FakeEngagementGateway gateway = new FakeEngagementGateway(Duration.ofMillis(200));
+        targets.stream().filter(target -> target.firmId().equals(hanging))
+                .forEach(target -> gateway.script(target.engagementId(), Behavior.HANG));
+
+        try (FanOutDispatcher dispatcher =
+                dispatcher(gateway, fixedLimiter(10, 10), config(Duration.ofSeconds(30), Duration.ZERO))) {
+            dispatcher.start();
+            await().atMost(TIMEOUT).until(() -> store.countUnfinished(healthy) <= 15);
+
+            assertThat(store.countLeased(hanging)).as("the hanging firm holds its share of 10 and no more")
+                    .isEqualTo(5);
+            await().atMost(TIMEOUT).until(() -> store.countUnfinished(healthy) == 0);
+        }
+
+        // The high-water mark depends on how the scheduler interleaves submits, so only the bounds are
+        // asserted: never over the share of 5, and at least two at once. That the firm was not starved is
+        // proved by all its items completing while the other firm held its slots.
+        assertThat(gateway.maxConcurrentFor(healthy)).as("the healthy firm kept a share of the slots")
+                .isBetween(2, 5);
+        assertThat(store.count(ItemStatus.DONE)).isEqualTo(30);
+    }
+
+    // ---- a lease for another firm is never run ----
+
+    @Test
+    void aLeaseForAnotherFirmIsNotRunIsLoggedWithoutTheRecordAndCoolsTheFirmOffWhileOthersAreServed() {
+        FirmId victim = new FirmId("a-victim");
+        FirmId source = new FirmId("c-source");
+        FirmId healthy = new FirmId("b-ok");
+        publish(victim, 1);
+        publish(healthy, 3);
+        publish(source, 1);
+        ItemId stolen = ItemId.of(source, PIN, new EngagementId("c-source-e0"));
+        ForeignLeasing leasing = new ForeignLeasing(store, victim, source);
+        MutableClock dispatcherClock = new MutableClock();
+        FakeEngagementGateway gateway = new FakeEngagementGateway(Duration.ofMillis(5));
+        AimdCapacityLimiter limiter = fixedLimiter(2, 2);
+
+        try (LogCapture log = LogCapture.of(FanOutDispatcher.class);
+                FanOutDispatcher dispatcher = dispatcher(leasing, store, new RoundRobinScheduler(), dispatcherClock,
+                        gateway, limiter, config(Duration.ofSeconds(30), Duration.ZERO))) {
+            dispatcher.start();
+            await().atMost(TIMEOUT).until(() -> store.countUnfinished(healthy) == 0);
+            await().atMost(TIMEOUT).until(() -> leasing.victimAsks() == 1);
+
+            passesWithoutTheClockMoving(leasing, 20);
+            assertThat(leasing.victimAsks()).as("cool-off of one idle delay (5 ms) has not passed").isEqualTo(1);
+            dispatcherClock.advance(Duration.ofMillis(5));
+            await().atMost(TIMEOUT).until(() -> leasing.victimAsks() >= 2);
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::message)
+                    .anySatisfy(message -> assertThat(message).contains(stolen.toString()).contains(victim.toString())
+                            .contains("lease expires").contains("skipping it for"))
+                    .allSatisfy(message -> assertThat(message).doesNotContain("WorkItem[").doesNotContain("Lease["));
+        }
+
+        assertThat(gateway.submittedAttemptIds(new EngagementId("c-source-e0"))).as("the foreign item was not run")
+                .isEmpty();
+        assertThat(store.statusOf(stolen)).as("left to lease expiry").isEqualTo(ItemStatus.LEASED);
+        assertThat(store.count(ItemStatus.DONE)).as("the healthy firm was served in the same passes").isEqualTo(3);
+        assertTheFullLimitIsAvailable(limiter);
+    }
+
+    private static void passesWithoutTheClockMoving(ForeignLeasing leasing, int passes) {
+        int target = leasing.passes() + passes;
+        await().atMost(TIMEOUT).until(() -> leasing.passes() >= target);
+    }
+
+    // ---- no port call can hold the worker for longer than the call timeout ----
+
+    @Test
+    void aStatusReadThatNeverReturnsReleasesItsPermitSoTheItemIsLeasedAgain() {
+        publish(BIG_FIRM, 1);
+        HangingGateway hanging = new HangingGateway(new FakeEngagementGateway(Duration.ZERO), Hang.STATUS, true);
+        ItemId id = ItemId.of(BIG_FIRM, PIN, new EngagementId("big-e0"));
+
+        try (FanOutDispatcher dispatcher = dispatcher(store, store, new RoundRobinScheduler(), clock, hanging,
+                fixedLimiter(1, 1), config(Duration.ofSeconds(30), Duration.ZERO, Duration.ofMillis(100)))) {
+            dispatcher.start();
+
+            // Delivery 1 reads the status three times (each cut off after 100 ms) and requeues as
+            // outcome unknown; delivery 2 needs the only permit again, so it was released.
+            await().atMost(TIMEOUT).until(() -> hanging.statusCalls() >= 4);
+        } finally {
+            hanging.release();
+        }
+
+        assertThat(hanging.submittedKeys()).as("one submit, then only status reads").hasSize(1);
+        assertThat(store.itemOf(id).attemptNumber()).as("the key never changed").isEqualTo(1);
+        assertThat(store.statusOf(id)).isNotEqualTo(ItemStatus.FAILED);
+    }
+
+    @Test
+    void aLeaseCallThatNeverReturnsForOneFirmDoesNotStopTheOtherFirmsFromBeingServedInLaterPasses() {
+        FirmId stuck = new FirmId("a-stuck");
+        FirmId healthy = new FirmId("b-ok");
+        publish(stuck, 2);
+        publish(healthy, 4);
+        HangingLeasing leasing = new HangingLeasing(store, false, stuck);
+
+        try (LogCapture log = LogCapture.of(FanOutDispatcher.class);
+                FanOutDispatcher dispatcher = dispatcher(leasing, new FakeEngagementGateway(Duration.ofMillis(5)),
+                        fixedLimiter(4, 4), config(Duration.ofSeconds(30), Duration.ZERO, Duration.ofMillis(100)))) {
+            dispatcher.start();
+
+            await().atMost(TIMEOUT).until(() -> store.countUnfinished(healthy) == 0);
+
+            assertThat(leasing.hungCalls()).as("the stuck firm was tried").isGreaterThanOrEqualTo(1);
+            assertThat(log.at(Level.WARNING)).anySatisfy(entry -> {
+                assertThat(entry.message()).contains("Leasing failed for firm a-stuck").contains("skipping it for");
+                assertThat(entry.thrown()).isInstanceOf(CallTimeoutException.class);
+            });
+        } finally {
+            leasing.release();
+        }
+
+        assertThat(store.countUnfinished(stuck)).as("its items wait").isEqualTo(2);
+        assertThat(store.count(ItemStatus.DONE)).isEqualTo(4);
+    }
+
+    @Test
+    void closeReturnsWhileAStoreCallIsHungAndTheFailedPassIsLogged() {
+        HangingLeasing leasing = new HangingLeasing(store, true, null);
+        FanOutDispatcher dispatcher = dispatcher(leasing, new FakeEngagementGateway(Duration.ZERO), fixedLimiter(1, 1),
+                config(Duration.ofSeconds(30), Duration.ZERO, Duration.ofMillis(100)));
+
+        try (LogCapture log = LogCapture.of(FanOutDispatcher.class)) {
+            dispatcher.start();
+            await().atMost(TIMEOUT).until(() -> leasing.hungCalls() >= 1);
+
+            assertTimeoutPreemptively(Duration.ofSeconds(10), dispatcher::close);
+
+            assertThat(dispatcher.isRunning()).isFalse();
+            assertThat(log.at(Level.WARNING)).anySatisfy(entry -> {
+                assertThat(entry.message()).startsWith("Dispatch pass failed");
+                assertThat(entry.thrown()).isInstanceOf(CallTimeoutException.class);
+            });
+        } finally {
+            leasing.release();
+        }
+    }
+
+    @Test
+    void closeInterruptsADispatchThreadThatIsStuckOutsideAnyBoundedCallAndStillShutsTheWorkersDown() {
+        CountDownLatch release = new CountDownLatch(1);
+        FairScheduler stuck = new FairScheduler() {
+            @Override
+            public List<FirmId> order(Set<FirmId> candidates) {
+                awaitUninterruptibly(release);
+                return List.of();
+            }
+
+            @Override
+            public void served(FirmId firmId) {
+            }
+        };
+        FanOutDispatcher dispatcher = dispatcher(store, store, stuck, clock, new FakeEngagementGateway(Duration.ZERO),
+                fixedLimiter(1, 1), config(Duration.ofSeconds(30), Duration.ZERO, Duration.ofMillis(100)));
+
+        try (LogCapture log = LogCapture.of(FanOutDispatcher.class)) {
+            dispatcher.start();
+
+            assertTimeoutPreemptively(Duration.ofSeconds(10), dispatcher::close);
+
+            assertThat(log.at(Level.WARNING)).extracting(LogCapture.Entry::message)
+                    .anySatisfy(message -> assertThat(message).contains("dispatch thread did not stop")
+                            .contains("interrupting it"));
+        } finally {
+            release.countDown();
+        }
+        await().atMost(TIMEOUT).until(() -> !dispatcher.isRunning());
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        while (latch.getCount() > 0) {
+            try {
+                latch.await();
+            } catch (InterruptedException ignored) {
+                // a thread stuck in a native call would not notice either
+            }
+        }
     }
 
     // ---- a pass that keeps failing backs off and does not flood the log ----
@@ -699,7 +904,7 @@ class FanOutDispatcherTest {
         };
         DispatcherConfig slowRetry = new DispatcherConfig(
                 Duration.ofSeconds(30), Duration.ofMillis(2), Duration.ofSeconds(5), Duration.ofSeconds(40),
-                Duration.ZERO);
+                Duration.ZERO, Duration.ofSeconds(10));
         FanOutDispatcher dispatcher =
                 dispatcher(alwaysDown, new FakeEngagementGateway(Duration.ZERO), fixedLimiter(1, 1), slowRetry);
         dispatcher.start();
@@ -714,6 +919,56 @@ class FanOutDispatcherTest {
 
         private Fatal() {
             super("simulated VM error");
+        }
+    }
+
+    /**
+     * A store whose calls block until released, ignoring interrupts like a stuck socket read: every
+     * {@code firmsWithDispatchableItems} call when {@code hangsFirms}, and every {@code leaseNext} for
+     * {@code hungFirm}. A released call throws, so it has no late effect.
+     */
+    private static final class HangingLeasing implements ItemLeasing {
+
+        private final ItemLeasing delegate;
+        private final boolean hangsFirms;
+        private final FirmId hungFirm;
+        private final CountDownLatch released = new CountDownLatch(1);
+        private final AtomicInteger hungCalls = new AtomicInteger();
+
+        private HangingLeasing(ItemLeasing delegate, boolean hangsFirms, FirmId hungFirm) {
+            this.delegate = delegate;
+            this.hangsFirms = hangsFirms;
+            this.hungFirm = hungFirm;
+        }
+
+        @Override
+        public Set<FirmId> firmsWithDispatchableItems(Instant now) {
+            if (hangsFirms) {
+                hang();
+            }
+            return delegate.firmsWithDispatchableItems(now);
+        }
+
+        @Override
+        public Optional<Lease> leaseNext(FirmId firmId, Instant now, Duration leaseDuration) {
+            if (firmId.equals(hungFirm)) {
+                hang();
+            }
+            return delegate.leaseNext(firmId, now, leaseDuration);
+        }
+
+        private void hang() {
+            hungCalls.incrementAndGet();
+            awaitUninterruptibly(released);
+            throw new IllegalStateException("released after the deadline");
+        }
+
+        int hungCalls() {
+            return hungCalls.get();
+        }
+
+        void release() {
+            released.countDown();
         }
     }
 
@@ -831,6 +1086,45 @@ class FanOutDispatcherTest {
                 throw new IllegalStateException("interrupted while handing back", e);
             }
             return delegate.requeue(lease, reason, notBefore);
+        }
+    }
+
+    /** A store that answers a lease request for one firm with a lease on an item of another firm. */
+    private static final class ForeignLeasing implements ItemLeasing {
+
+        private final ItemLeasing delegate;
+        private final FirmId victim;
+        private final FirmId source;
+        private final AtomicInteger victimAsks = new AtomicInteger();
+        private final AtomicInteger passes = new AtomicInteger();
+
+        private ForeignLeasing(ItemLeasing delegate, FirmId victim, FirmId source) {
+            this.delegate = delegate;
+            this.victim = victim;
+            this.source = source;
+        }
+
+        @Override
+        public Set<FirmId> firmsWithDispatchableItems(Instant now) {
+            passes.incrementAndGet();
+            return delegate.firmsWithDispatchableItems(now);
+        }
+
+        @Override
+        public Optional<Lease> leaseNext(FirmId firmId, Instant now, Duration leaseDuration) {
+            if (firmId.equals(victim)) {
+                victimAsks.incrementAndGet();
+                return delegate.leaseNext(source, now, leaseDuration);
+            }
+            return delegate.leaseNext(firmId, now, leaseDuration);
+        }
+
+        int victimAsks() {
+            return victimAsks.get();
+        }
+
+        int passes() {
+            return passes.get();
         }
     }
 

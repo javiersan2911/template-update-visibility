@@ -65,6 +65,11 @@ import java.util.function.Supplier;
  *       nothing was written; it is logged, and nothing that follows a successful write
  *       (such as reporting a success to the capacity feedback) is done.</li>
  *   <li>The detail stored with a terminal status is one line of at most 500 characters.</li>
+ *   <li>Every call to the gateway, the offer verifier and the store runs under the
+ *       configured call timeout, enforced here and not left to the adapter. A call that
+ *       times out is handled like one that threw: a submit leaves the outcome unknown under
+ *       the same key, a status read is unreadable, a failed offer check or lease renewal
+ *       before the submit means nothing was attempted.</li>
  * </ul>
  */
 public final class ItemProcessor {
@@ -90,6 +95,7 @@ public final class ItemProcessor {
     private final DispatcherConfig config;
     private final Clock clock;
     private final long attemptTimeoutNanos;
+    private final BoundedCalls calls;
 
     public ItemProcessor(
             LeaseWriter store,
@@ -107,6 +113,7 @@ public final class ItemProcessor {
         this.config = Objects.requireNonNull(config, "config");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.attemptTimeoutNanos = nanosSaturating(config.attemptTimeout());
+        this.calls = new BoundedCalls(config.callTimeout());
     }
 
     /**
@@ -132,9 +139,30 @@ public final class ItemProcessor {
             handBack(lease);
             Thread.currentThread().interrupt();
         } catch (RuntimeException e) {
+            if (handedBackOnShutdown(lease, "work")) {
+                return;
+            }
             LOG.log(Level.WARNING, "Unexpected failure on item " + lease.item().id(), e);
             retryAfterUnexpectedFailure(lease);
         }
+    }
+
+    /**
+     * One rule for every bounded call that threw: if the thread's interrupt flag is set, the
+     * call was cut short by a shutdown (the bounded call restores the flag when the wait is
+     * interrupted), so the item is handed back as an {@link InterruptedException} at that point
+     * would hand it back, and the flag stays set for the caller. Otherwise it is an ordinary failure.
+     *
+     * @return whether the item was handed back
+     */
+    private boolean handedBackOnShutdown(Lease lease, String step) {
+        if (!Thread.currentThread().isInterrupted()) {
+            return false;
+        }
+        LOG.log(Level.INFO, "The {0} on item {1} was cut short by a shutdown; handing it back",
+                step, lease.item().id());
+        handBack(lease);
+        return true;
     }
 
     private void run(Lease lease) throws InterruptedException {
@@ -160,7 +188,8 @@ public final class ItemProcessor {
             return;
         }
         Optional<Boolean> offered = beforeSubmit(lease, "offer check",
-                () -> offerVerifier.isStillOffered(item.engagementId(), item.pin()));
+                () -> calls.call("offer verifier",
+                        () -> offerVerifier.isStillOffered(item.engagementId(), item.pin())));
         if (offered.isEmpty()) {
             return;
         }
@@ -174,7 +203,8 @@ public final class ItemProcessor {
         SubmitResult result;
         try {
             result = Objects.requireNonNull(
-                    gateway.submit(ApplyCommand.forItem(item)), "gateway returned a null submit result");
+                    calls.call("gateway.submit", () -> gateway.submit(ApplyCommand.forItem(item))),
+                    "gateway returned a null submit result");
         } catch (RuntimeException e) {
             if (Thread.interrupted()) {
                 LOG.log(Level.INFO, "Submit for item {0} was cut short by a shutdown; handing it back", item.id());
@@ -218,6 +248,9 @@ public final class ItemProcessor {
         try {
             return Optional.of(action.get());
         } catch (RuntimeException e) {
+            if (handedBackOnShutdown(lease, step)) {
+                return Optional.empty();
+            }
             LOG.log(Level.WARNING, "Could not do the " + step + " for item " + lease.item().id()
                     + "; nothing was submitted, requeueing", e);
             requeueNotAttempted(lease, true);
@@ -324,7 +357,8 @@ public final class ItemProcessor {
     }
 
     private boolean renewLease(Lease lease) {
-        boolean renewed = store.renew(lease, clock.instant().plus(config.leaseDuration()));
+        Instant newExpiry = clock.instant().plus(config.leaseDuration());
+        boolean renewed = calls.call("store.renew", () -> store.renew(lease, newExpiry));
         if (!renewed) {
             LOG.log(Level.WARNING, "Lost the lease on item {0}; leaving it to the new owner",
                     lease.item().id());
@@ -423,7 +457,8 @@ public final class ItemProcessor {
 
     /** Records a terminal status; a {@code false} means the lease was lost and nothing was written. */
     private boolean finish(Lease lease, ItemStatus status, String detail) {
-        boolean written = store.finish(lease, status, boundedDetail(detail));
+        String storedDetail = boundedDetail(detail);
+        boolean written = calls.call("store.finish", () -> store.finish(lease, status, storedDetail));
         if (!written) {
             warnLeaseLost(lease, "finish as " + status);
         }
@@ -432,7 +467,7 @@ public final class ItemProcessor {
 
     /** Sends the item back; a {@code false} means the lease was lost and nothing was written. */
     private boolean requeue(Lease lease, RequeueReason reason, Instant notBefore) {
-        boolean written = store.requeue(lease, reason, notBefore);
+        boolean written = calls.call("store.requeue", () -> store.requeue(lease, reason, notBefore));
         if (!written) {
             warnLeaseLost(lease, "requeue as " + reason);
         }
@@ -501,11 +536,19 @@ public final class ItemProcessor {
         Optional<AttemptStatus> next() {
             try {
                 AttemptStatus status = Objects.requireNonNull(
-                        gateway.status(lease.item().attemptId()), "gateway returned a null status");
+                        calls.call("gateway.status", () -> gateway.status(lease.item().attemptId())),
+                        "gateway returned a null status");
                 consecutiveFailures = 0;
                 consecutiveNotFound = status == AttemptStatus.NOT_FOUND ? consecutiveNotFound + 1 : 0;
                 return Optional.of(status);
             } catch (RuntimeException e) {
+                if (Thread.currentThread().isInterrupted()) {
+                    // A shutdown, not evidence about the attempt: not counted, no trouble reported. The
+                    // caller's next sleep throws InterruptedException and hands the item back.
+                    LOG.log(Level.INFO, "Status read for item {0} was cut short by a shutdown",
+                            lease.item().id());
+                    return Optional.empty();
+                }
                 consecutiveFailures++;
                 LOG.log(Level.WARNING, "Status read failed for item " + lease.item().id()
                         + " (" + consecutiveFailures + " consecutive)", e);

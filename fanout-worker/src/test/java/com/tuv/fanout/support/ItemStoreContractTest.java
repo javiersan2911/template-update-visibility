@@ -51,6 +51,10 @@ abstract class ItemStoreContractTest {
         return WorkItem.create(FIRM, new EngagementId(engagement), PIN);
     }
 
+    private static WorkItem itemOf(FirmId firm, String engagement) {
+        return WorkItem.create(firm, new EngagementId(engagement), PIN);
+    }
+
     private Lease leaseAt(Instant now) {
         return store.leaseNext(FIRM, now, LEASE).orElseThrow();
     }
@@ -64,6 +68,20 @@ abstract class ItemStoreContractTest {
         assertThat(store.enqueue(List.of(item("e1"), item("e2"), item("e3")))).isEqualTo(1);
 
         assertThat(store.statusOf(lease.item().id())).isEqualTo(ItemStatus.DONE);
+    }
+
+    @Test
+    void aLeaseReturnedForAFirmBelongsToThatFirm() {
+        FirmId other = new FirmId("firm-b");
+        store.enqueue(List.of(itemOf(other, "e1"), itemOf(FIRM, "e2"), itemOf(other, "e3")));
+
+        Lease forFirm = store.leaseNext(FIRM, T0, LEASE).orElseThrow();
+        Lease forOther = store.leaseNext(other, T0, LEASE).orElseThrow();
+
+        assertThat(forFirm.item().firmId()).isEqualTo(FIRM);
+        assertThat(forOther.item().firmId()).isEqualTo(other);
+        assertThat(store.leaseNext(FIRM, T0, LEASE)).as("no item of the firm is left, whatever the others hold")
+                .isEmpty();
     }
 
     @Test

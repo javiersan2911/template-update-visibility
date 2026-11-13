@@ -22,9 +22,14 @@ final class Require {
         return value;
     }
 
+    /** Whether the value is an identifier part; the one definition of the charset, also used to check joined ids. */
+    static boolean isIdentifier(String value) {
+        return value != null && IDENTIFIER.matcher(value).matches();
+    }
+
     /** The message names the rule, never the rejected value, which may be hostile. */
     static String identifier(String value, String name) {
-        if (value == null || !IDENTIFIER.matcher(value).matches()) {
+        if (!isIdentifier(value)) {
             throw new IllegalArgumentException(name + " must match " + IDENTIFIER.pattern());
         }
         return value;

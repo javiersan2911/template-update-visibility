@@ -28,6 +28,10 @@ public record WorkItem(
         Objects.requireNonNull(firmId, "firmId");
         Objects.requireNonNull(engagementId, "engagementId");
         Objects.requireNonNull(pin, "pin");
+        if (!id.equals(ItemId.of(firmId, pin, engagementId))) {
+            // The attempt id, hence the idempotency key, derives from the id: it must name this item's own firm.
+            throw new IllegalArgumentException("item id does not match the item's firm, version pin and engagement");
+        }
         if (attemptNumber < 1) {
             throw new IllegalArgumentException("attempt number starts at 1");
         }

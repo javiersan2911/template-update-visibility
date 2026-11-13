@@ -7,7 +7,7 @@ import java.util.Objects;
  * @param floor            the global limit never drops below this
  * @param ceiling          the global limit never rises above this
  * @param initialLimit     global limit at start-up
- * @param perFirmCap       concurrent items allowed for a single firm
+ * @param perFirmCap       concurrent items allowed for a single firm; at most {@code ceiling}
  * @param increaseStep     slots added per healthy interval
  * @param increaseInterval minimum time between two increases
  * @param decreaseFactor   multiplier applied on overload, in (0, 1)
@@ -81,6 +81,9 @@ public record AimdConfig(
         }
         if (perFirmCap < 1 || increaseStep < 1) {
             throw new IllegalArgumentException("per-firm cap and increase step must be positive");
+        }
+        if (perFirmCap > ceiling) {
+            throw new IllegalArgumentException("per-firm cap must not exceed the ceiling of the global limit");
         }
         if (!(decreaseFactor > 0 && decreaseFactor < 1)) {
             throw new IllegalArgumentException("decrease factor must be in (0, 1)");

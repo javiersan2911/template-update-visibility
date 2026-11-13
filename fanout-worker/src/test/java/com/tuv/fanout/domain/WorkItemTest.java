@@ -51,6 +51,36 @@ class WorkItemTest {
                 () -> new WorkItem(ItemId.of(FIRM, PIN, ENGAGEMENT), FIRM, ENGAGEMENT, PIN, 1, 0, -1));
     }
 
+    @Test
+    void anIdThatDoesNotNameTheItemsOwnFirmPinAndEngagementIsRejected() {
+        FirmId otherFirm = new FirmId("firm-b");
+        EngagementId otherEngagement = new EngagementId("e2");
+        VersionPin otherPin = new VersionPin("audit", 8);
+
+        assertThatIllegalArgumentException().as("firm A's id on a firm B item").isThrownBy(
+                () -> new WorkItem(ItemId.of(FIRM, PIN, ENGAGEMENT), otherFirm, ENGAGEMENT, PIN, 1, 0, 0));
+        assertThatIllegalArgumentException().as("another engagement").isThrownBy(
+                () -> new WorkItem(ItemId.of(FIRM, PIN, ENGAGEMENT), FIRM, otherEngagement, PIN, 1, 0, 0));
+        assertThatIllegalArgumentException().as("another version").isThrownBy(
+                () -> new WorkItem(ItemId.of(FIRM, PIN, ENGAGEMENT), FIRM, ENGAGEMENT, otherPin, 1, 0, 0));
+    }
+
+    @Test
+    void theMessageForAMismatchedIdDoesNotEchoTheValues() {
+        FirmId otherFirm = new FirmId("firm-hostile-b");
+
+        assertThatIllegalArgumentException().isThrownBy(
+                        () -> new WorkItem(ItemId.of(FIRM, PIN, ENGAGEMENT), otherFirm, ENGAGEMENT, PIN, 1, 0, 0))
+                .satisfies(e -> assertThat(e.getMessage())
+                        .doesNotContain("firm-hostile-b").doesNotContain("firm-a").doesNotContain("e1"));
+    }
+
+    @Test
+    void anIdThatMatchesIsAccepted() {
+        assertThat(new WorkItem(ItemId.of(FIRM, PIN, ENGAGEMENT), FIRM, ENGAGEMENT, PIN, 1, 0, 0).id())
+                .isEqualTo(ItemId.of(FIRM, PIN, ENGAGEMENT));
+    }
+
     @ParameterizedTest(name = "{0}")
     @EnumSource(value = RequeueReason.class, names = {"CAPACITY_DEFERRED", "NOT_ATTEMPTED"})
     void anItemThatWasNeverLeasedCannotBeRequeuedWithARefund(RequeueReason refundingReason) {
