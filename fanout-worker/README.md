@@ -8,6 +8,138 @@ interfaces, and the store and downstream system are faked in tests.
 mvn test        # Java 21+, Maven 3.9+
 ```
 
+## In plain words
+
+When a template version is published, a firm may want it applied to hundreds or thousands
+of engagement files. Applying it to one file takes about a minute, and that minute is spent
+in a system owned by another team, which can only handle so many at once.
+
+This worker is the queue manager in between. It works like a ticket counter:
+
+- **One ticket per file.** The publish is turned into a list of tickets, one per engagement
+  file. Hearing about the same publish twice creates no extra tickets.
+- **Firms take turns.** One ticket per firm per round, so a firm with 40,000 files cannot
+  make a firm with 40 wait behind it.
+- **It watches how busy the other system is.** It starts carefully, speeds up slowly while
+  things go well, and halves its pace the moment the other system says "too many requests".
+  If one firm's files keep causing trouble, only that firm is slowed down.
+- **It checks before acting.** Just before a file's turn it asks whether this version is
+  still the right one for that file. If the version was withdrawn or replaced, the file is
+  skipped.
+- **Nothing is done twice or lost.** Each attempt carries a reference number. After a crash
+  or a timeout the worker first asks "what happened to this reference?" and carries on from
+  the answer; it does not start again blindly.
+- **It gives up in a defined way.** A file that keeps failing is tried a limited number of
+  times, with longer waits in between, then marked as failed with the reason.
+
+## Architecture at a glance
+
+### The parts
+
+```mermaid
+flowchart LR
+  PUB["A version is published"] --> PFO["PublishFanOut: makes one item per file"]
+  SRC["FanOutSource: which files are waiting for this version"] --> PFO
+  PFO --> STORE[("ItemStore: the durable list of items and their leases")]
+
+  subgraph WORKER["The worker"]
+    DISP["FanOutDispatcher: one loop that picks the next item"]
+    RR["RoundRobinScheduler: whose turn it is"]
+    CAP["AimdCapacityLimiter: how many may run at once"]
+    PROC["ItemProcessor: handles one item, one lightweight thread each"]
+  end
+
+  STORE --> DISP
+  RR --> DISP
+  CAP --> DISP
+  DISP --> PROC
+  PROC -->|"still the right version?"| OV["OfferVerifier"]
+  PROC -->|"submit, then ask for status"| GW["EngagementGateway: the other team's system"]
+  PROC -->|"result, retry or hand back"| STORE
+  PROC -->|"how it went"| CAP
+```
+
+The boxes outside the worker are interfaces ("ports"). The tests plug in fakes; production
+plugs in a database, the engagement system and the offer lookup (see *Ports to implement
+for production*).
+
+### The life of one item
+
+```mermaid
+sequenceDiagram
+  participant D as Dispatcher
+  participant S as Item store
+  participant P as Item processor
+  participant O as Offer check
+  participant G as Engagement system
+
+  D->>D: Is it this firm's turn, and is there capacity?
+  D->>S: Lease the firm's next item
+  S-->>D: Item, with a time-limited lease
+  D->>P: Start on its own thread
+  P->>G: On a redelivery: what happened to the earlier attempt?
+  P->>O: Is this version still the offer for this file?
+  O-->>P: Yes
+  P->>G: Submit, with the attempt's reference number
+  G-->>P: Accepted
+  loop every 5 s until finished, 10 min at most
+    P->>G: Status?
+    P->>S: Renew the lease
+  end
+  G-->>P: Succeeded
+  P->>S: Mark the item DONE
+  P->>D: Release capacity, report success
+```
+
+A **lease** is a time-limited claim on an item (5 minutes by default, renewed while work
+continues). If the worker dies, the lease runs out and the item becomes available again. A
+worker whose lease ran out can no longer write to that item, so two workers never record
+conflicting results.
+
+### Where an item can end up
+
+```mermaid
+stateDiagram-v2
+  state "READY: waiting for a turn" as READY
+  state "LEASED: being worked on" as LEASED
+  state "DONE: update applied" as DONE
+  state "SKIPPED_OFFER_CHANGED: no longer the right version" as SKIPPED
+  state "FAILED: gave up, with the reason" as FAILED
+
+  [*] --> READY : created from the publish
+  READY --> LEASED : its firm's turn, capacity free
+  LEASED --> DONE : the engagement system reports success
+  LEASED --> SKIPPED : the offer changed, or the version was rejected
+  LEASED --> READY : retry later (throttled, failed, outcome unknown, worker stopping)
+  LEASED --> READY : lease ran out after a crash
+  LEASED --> FAILED : out of attempts, or a permanent rejection
+  DONE --> [*]
+  SKIPPED --> [*]
+  FAILED --> [*]
+```
+
+### How the pace is set
+
+| Signal from the engagement system | What the worker does |
+|---|---|
+| Everything is fine | Raises the overall limit a little at a time (by default +5 every 5 minutes, from 10 up to 100) |
+| "Too many requests" (HTTP 429) | Halves the overall limit and stops starting new items for as long as asked, 15 minutes at most |
+| Timeouts or errors for one firm's files | Halves that firm's own limit (50 by default); it recovers with time |
+| Trouble from several firms at once | Lowers the overall limit too |
+
+### Defaults
+
+| Setting | Default |
+|---|---|
+| Items running at once, overall | Starts at 10, between 10 and 100 |
+| Items running at once, per firm | 50 |
+| Lease | 5 minutes |
+| Status check | Every 5 seconds |
+| Wait for one attempt | 10 minutes |
+| Attempts per item | 3, with a wait of 30 seconds to 10 minutes between them |
+
+The rest of this page is the technical reference.
+
 ## How one publish is processed
 
 1. `PublishFanOut` turns the publish into durable items, one per engagement. The item id is
