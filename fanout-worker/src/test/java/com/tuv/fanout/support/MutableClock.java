@@ -9,7 +9,8 @@ import java.time.ZoneOffset;
 /** A clock that only moves when the test says so. */
 public final class MutableClock extends Clock {
 
-    private Instant now = Instant.parse("2026-11-12T00:00:00Z");
+    /** Volatile: the test thread advances it while the code under test reads it on another thread. */
+    private volatile Instant now = Instant.parse("2026-11-12T00:00:00Z");
 
     public void advance(Duration duration) {
         now = now.plus(duration);

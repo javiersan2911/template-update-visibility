@@ -3,6 +3,7 @@ package com.tuv.fanout.port;
 import com.tuv.fanout.domain.EngagementId;
 import com.tuv.fanout.domain.FirmId;
 import com.tuv.fanout.domain.VersionPin;
+import java.util.Objects;
 import java.util.stream.Stream;
 
 /**
@@ -16,5 +17,10 @@ public interface FanOutSource {
     Stream<Target> targetsFor(VersionPin pin);
 
     record Target(FirmId firmId, EngagementId engagementId) {
+
+        public Target {
+            Objects.requireNonNull(firmId, "firmId");
+            Objects.requireNonNull(engagementId, "engagementId");
+        }
     }
 }

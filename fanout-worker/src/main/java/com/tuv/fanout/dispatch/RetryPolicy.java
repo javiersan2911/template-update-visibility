@@ -29,6 +29,8 @@ public final class RetryPolicy {
         if (maxDeliveries < 1) {
             throw new IllegalArgumentException("at least one delivery is required");
         }
+        Objects.requireNonNull(baseDelay, "baseDelay");
+        Objects.requireNonNull(maxDelay, "maxDelay");
         if (baseDelay.isNegative() || maxDelay.compareTo(baseDelay) < 0) {
             throw new IllegalArgumentException("require 0 <= baseDelay <= maxDelay");
         }
@@ -70,14 +72,23 @@ public final class RetryPolicy {
     /**
      * Delay before the delivery that follows {@code deliveryCount}. The exponential value
      * is capped, then drawn from its upper half so retries spread out without ever firing
-     * immediately.
+     * immediately. A delay too large for milliseconds in a {@code long} counts as the
+     * largest one that fits, so no configuration makes this method throw.
      */
     public Duration backoff(int deliveryCount) {
         int doublings = Math.min(Math.max(deliveryCount - 1, 0), 30);
-        long maxMillis = maxDelay.toMillis();
-        long baseMillis = baseDelay.toMillis();
+        long maxMillis = millisSaturating(maxDelay);
+        long baseMillis = millisSaturating(baseDelay);
         long cappedMillis = baseMillis > (maxMillis >> doublings) ? maxMillis : baseMillis << doublings;
         long half = cappedMillis / 2;
         return Duration.ofMillis(half + random.nextLong(cappedMillis - half + 1));
+    }
+
+    private static long millisSaturating(Duration duration) {
+        try {
+            return duration.toMillis();
+        } catch (ArithmeticException e) {
+            return Long.MAX_VALUE;
+        }
     }
 }

@@ -130,8 +130,13 @@ public final class AimdCapacityLimiter implements CapacityLimiter {
         if (now.isBefore(lastIncrease.plus(config.increaseInterval()))) {
             return;
         }
-        limit = Math.min(config.ceiling(), limit + config.increaseStep());
+        limit = saturatingAdd(limit, config.increaseStep(), config.ceiling());
         lastIncrease = now;
+    }
+
+    /** {@code value + step} capped at {@code ceiling}; computed in {@code long}, so a ceiling near {@code Integer.MAX_VALUE} cannot wrap. */
+    private static int saturatingAdd(int value, int step, int ceiling) {
+        return (int) Math.min(ceiling, (long) value + step);
     }
 
     private void decreaseGlobally(Instant now) {
